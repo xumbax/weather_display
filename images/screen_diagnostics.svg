@@ -1,0 +1,25 @@
+<svg viewBox="0 0 280 380" xmlns="http://www.w3.org/2000/svg" role="img">
+<title>Diagnostics screen mockup</title>
+<desc>Black screen listing sensor IDs distance age and current search radius for each parameter type, one excluded as broken zero in red</desc>
+<rect x="0" y="0" width="280" height="380" fill="#1a1a1a" rx="14"/>
+<rect x="20" y="30" width="240" height="320" fill="#000000" rx="4" stroke="#333" stroke-width="2"/>
+<rect x="20" y="30" width="240" height="44" fill="#000000"/>
+<line x1="20" y1="74" x2="260" y2="74" stroke="#444" stroke-width="1"/>
+<text x="26" y="56" font-family="monospace" font-size="13" fill="#97c459">Mo 23.06 21:46</text>
+<text x="226" y="56" font-family="monospace" font-size="13" fill="#ffffff">15.6C</text>
+<text x="26" y="92" font-family="monospace" font-size="11" fill="#3ecfcf">DIAGNOSTICS</text>
+<text x="26" y="108" font-family="monospace" font-size="9" fill="#ffffff">TEMP:</text>
+<text x="150" y="108" font-family="monospace" font-size="9" fill="#888888">r=10km</text>
+<text x="30" y="118" font-family="monospace" font-size="8" fill="#97c459">S31205 2.3km 1m</text>
+<text x="30" y="128" font-family="monospace" font-size="8" fill="#97c459">S58831 4.1km 2m</text>
+<text x="26" y="146" font-family="monospace" font-size="9" fill="#ffffff">HUMIDITY:</text>
+<text x="150" y="146" font-family="monospace" font-size="9" fill="#888888">r=25km</text>
+<text x="30" y="156" font-family="monospace" font-size="8" fill="#e05c5c">S70221 9.0km 12m [0!]</text>
+<text x="30" y="166" font-family="monospace" font-size="8" fill="#97c459">S40330 11.2km 3m</text>
+<text x="26" y="184" font-family="monospace" font-size="9" fill="#ffffff">PRESSURE:</text>
+<text x="150" y="184" font-family="monospace" font-size="9" fill="#888888">r=10km</text>
+<text x="30" y="194" font-family="monospace" font-size="8" fill="#97c459">S44509 2.3km 1m</text>
+<text x="26" y="212" font-family="monospace" font-size="9" fill="#ffffff">WIND:</text>
+<text x="150" y="212" font-family="monospace" font-size="9" fill="#888888">r=40km</text>
+<text x="30" y="222" font-family="monospace" font-size="8" fill="#666666">waiting</text>
+</svg>

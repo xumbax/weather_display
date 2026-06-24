@@ -1,0 +1,35 @@
+<svg viewBox="0 0 280 380" xmlns="http://www.w3.org/2000/svg" role="img">
+<title>Temp and humidity screen mockup</title>
+<desc>Black screen with header showing date time and temperature, large temperature value with trend bar, humidity value below with its own trend bar</desc>
+<rect x="0" y="0" width="280" height="380" fill="#1a1a1a" rx="14"/>
+<rect x="20" y="30" width="240" height="320" fill="#000000" rx="4" stroke="#333" stroke-width="2"/>
+<rect x="20" y="30" width="240" height="44" fill="#000000"/>
+<line x1="20" y1="74" x2="260" y2="74" stroke="#444" stroke-width="1"/>
+<text x="26" y="56" font-family="monospace" font-size="13" fill="#97c459">Mo 23.06 21:46</text>
+<text x="226" y="56" font-family="monospace" font-size="13" fill="#ffffff">15.6C</text>
+<text x="26" y="135" font-family="monospace" font-size="56" fill="#ffffff" font-weight="bold">15.6</text>
+<text x="170" y="100" font-family="monospace" font-size="11" fill="#888888">C</text>
+<text x="170" y="118" font-family="monospace" font-size="11" fill="#888888">Temp</text>
+<rect x="26" y="158" width="6" height="10" fill="#97c459"/>
+<rect x="34" y="150" width="6" height="18" fill="#97c459"/>
+<rect x="42" y="145" width="6" height="23" fill="#97c459"/>
+<rect x="50" y="140" width="6" height="28" fill="#97c459"/>
+<rect x="58" y="148" width="6" height="20" fill="#97c459"/>
+<rect x="66" y="143" width="6" height="25" fill="#97c459"/>
+<rect x="74" y="138" width="6" height="30" fill="#3ecfcf"/>
+<text x="26" y="225" font-family="monospace" font-size="42" fill="#ffffff" font-weight="bold">62.3</text>
+<text x="150" y="195" font-family="monospace" font-size="11" fill="#888888">%</text>
+<text x="150" y="212" font-family="monospace" font-size="11" fill="#888888">Wet</text>
+<rect x="26" y="245" width="6" height="8" fill="#97c459"/>
+<rect x="34" y="240" width="6" height="13" fill="#97c459"/>
+<rect x="42" y="238" width="6" height="15" fill="#97c459"/>
+<rect x="50" y="235" width="6" height="18" fill="#97c459"/>
+<rect x="58" y="239" width="6" height="14" fill="#97c459"/>
+<rect x="66" y="236" width="6" height="17" fill="#3ecfcf"/>
+<circle cx="120" cy="335" r="3" fill="#ffffff"/>
+<circle cx="132" cy="335" r="3" fill="#555555"/>
+<circle cx="144" cy="335" r="3" fill="#555555"/>
+<circle cx="156" cy="335" r="3" fill="#555555"/>
+<circle cx="168" cy="335" r="3" fill="#555555"/>
+<circle cx="180" cy="335" r="3" fill="#555555"/>
+</svg>

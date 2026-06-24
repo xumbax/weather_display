@@ -1,32 +1,34 @@
-# Weather display on ESP32 + ST7789 (narodmon.ru data)
+# Weather display v3 — ESP32 + ST7789 (narodmon.ru + Yandex.Weather)
 
-A standalone ESP32 device that pulls readings from the nearest public sensors on the [narodmon.ru](https://narodmon.ru) project (temperature, humidity, pressure, wind, radiation, dust, precipitation), averages them with distance-based weighting, and displays them on a TFT screen as a carousel of large, easy-to-read screens.
+A standalone ESP32 weather display that combines readings from nearby public sensors on [narodmon.ru](https://narodmon.ru) with forecast data from Yandex.Weather, shown on a TFT screen as a carousel of 6 large, easy-to-read screens.
 
 Author: **xumbax**
 
-![Temperature screen](images/screen_temperature.png)
+![Temperature and humidity screen](images/screen_temp_humidity.png)
 
-## Why
+## Why v3
 
-I couldn't find a ready-made weather station that aggregates nearby public sensor data this way, and building my own full sensor set (thermometer, barometer, anemometer, dosimeter) felt redundant when dozens of public devices already report to narodmon nearby. The idea is to take several of the closest sensors of each type and average them with distance-based weighting, which is more robust to outliers than relying on a single random device.
+The previous version mixed in Open-Meteo as a third data source — this release drops it entirely in favor of a tighter two-source design: narodmon for hyper-local sensor data, Yandex.Weather for forecast. The sensor-discovery logic was also reworked to be adaptive rather than fixed, and wind direction got a proper vector-based "prevailing direction" treatment instead of a meaningless trend bar.
+
+This release also went through a cleanup pass: a few functions and struct fields left over from earlier iterations (an unused GraphQL-era POST helper, an unused haversine-distance function, a couple of fields that were parsed but never displayed) were removed, and header/inline comments that had drifted out of sync with the actual code were corrected.
 
 ## Features
 
-- **8 parameters**: temperature, humidity, pressure, wind speed and direction, radiation level, air dust concentration, precipitation
-- **Distance-weighted averaging (IDW)** — `w = 1 / (d + ε)^p`, closer sensors carry more weight; the number of sensors used, the decay exponent, and the search radius are all runtime settings, not hardcoded constants
-- **9-screen carousel** — 8 parameter screens plus a diagnostic screen listing the IDs, distances, and data age of every sensor currently in use
-- **Trend indicator** on every screen — 4 bars (3h / 1h / 20min / now), bar height shows the relative level of the value at that point in time; history is kept in RAM from the device's own measurements, with no extra requests to the server
-- **Multi-device request scheduling** — period/offset based on minute-of-day (UTC), so several of these displays can run side by side without colliding on the 1 request/minute API limit
-- **Automatic sensor type code discovery** via `appInit` — narodmon doesn't publish an official table of numeric `type` codes, so the firmware looks them up by name at startup instead of hardcoding guessed numbers
-- **Alarms** when a parameter crosses a threshold (extreme cold/heat, storm winds, radiation, dust storm) — a dedicated alert screen, the LED stays solidly lit, and a buzzer beeps once every 15 minutes
-- **LED-based connectivity diagnostics** — a single priority hierarchy: no WiFi → blinks once a second, WiFi up but API unreachable → once every 3 seconds, API reachable but no sensors found → once every 5 seconds, everything fine → LED off
-- **Self-healing reboot** — if the device has been stuck in a problem state (WiFi/API/sensors) for 30+ minutes straight, it reboots itself
+- **Adaptive search radius per parameter** — starts at 10 km, expands by 15 km steps (up to 100 km) only for parameter types still short on sensors, stops once 2 sensors are found. A value is shown on screen with just 1 sensor — N/D only when there are truly none nearby.
+- **"Oldest data first" sensor polling** — instead of simple round-robin, every minute the 3 sensors with the stalest known readings are queried (narodmon's API limit is 3 sensors per request), with a 5-minute-per-sensor cooldown so a sensor isn't hammered just because it's technically "oldest".
+- **Broken-zero sensor detection** — if 2+ sensors of the same type are fresh and one reads exactly 0.0 while another differs by more than a configurable threshold, the zero reading is excluded from averaging instead of skewing the result.
+- **6 screens, grouped by meaning**: Temperature+Humidity, Wind+Direction+Pressure, Air Quality+Radiation+Precipitation, Yandex current+2h-ahead forecast, Yandex 2-day forecast, diagnostics.
+- **Wind direction done right** — a vector sum of direction samples (not a naive average, which would turn 350° and 10° into "south") gives a proper prevailing direction. The screen shows current direction, the 1-hour vector average right next to it, and three text labels (24h/12h/6h) instead of a jittery trend bar.
+- **Per-parameter alerts, not full-screen** — when a threshold is crossed, only that parameter's number turns red. The LED lights solid only while an alert screen is being shown; the buzzer beeps once per screen display, throttled to at most once every 15 minutes across all alerts combined.
+- **Adaptive Yandex.Weather scheduling** — instead of a fixed interval, the next request is scheduled for exactly 30 minutes before the current "+2h" forecast slot expires, keeping the displayed forecast always within a tight, predictable margin while staying well under the free tier's 30 requests/day limit.
+- **TTP223 touch button** — a tap forces screen 0 and opens a 30-second manual-navigation window; further taps within that window step through screens; after 30 seconds of inactivity the regular carousel resumes from wherever it was left.
+- **No Cyrillic on screen** — TFT_eSPI's built-in font has no Cyrillic glyphs, so all on-screen text is English; logs to Serial Monitor remain in Russian for readability during setup.
 
 ## Screens
 
-| Parameter screen | Diagnostic screen | Alarm |
+| Temp / Humidity | Wind / Direction / Pressure | Diagnostics |
 |---|---|---|
-| ![temperature](images/screen_temperature.png) | ![diagnostic](images/screen_service.png) | ![alarm](images/screen_alarm.png) |
+| ![temp/humidity](images/screen_temp_humidity.png) | ![wind/pressure](images/screen_wind_pressure.png) | ![diagnostics](images/screen_diagnostics.png) |
 
 *These images are illustrative mockups of the screen layout, not photos of an actual unit.*
 
@@ -36,25 +38,24 @@ I couldn't find a ready-made weather station that aggregates nearby public senso
 - 2.0" ST7789 TFT display, 240×320, SPI
 - LED + 220 Ω resistor
 - 5V active piezo buzzer
-
-Full wiring diagram, shopping list, and `TFT_eSPI` library setup are in [docs/setup_guide.html](docs/setup_guide.html).
+- TTP223 touch sensor module
 
 ## Setup
 
 1. Arduino IDE + ESP32 board package
 2. Libraries: `TFT_eSPI` (Bodmer), `ArduinoJson` v6 (Benoit Blanchon), `NTPClient` (Fabrice Weinberg)
-3. Configure `User_Setup.h` in the `TFT_eSPI` library for your display's pinout (details in the guide)
+3. Configure `User_Setup.h` in the `TFT_eSPI` library for an ST7789 240×320 display
 4. Open `weather_display.ino` and fill in:
    - `WIFI_SSID`, `WIFI_PASS`
-   - `NM_API_KEY` — obtained from narodmon.ru → Profile → My applications
+   - `NM_API_KEY` — narodmon.ru → Profile → My applications
+   - `YANDEX_WEATHER_KEY` — Yandex developer console → Weather Data API → free "smart home" tier
    - `MY_LAT`, `MY_LON` — coordinates of your observation point
-5. Flash, then open Serial Monitor at 115200 baud for diagnostics
+5. Flash, then open Serial Monitor at 115200 baud
 
-## narodmon API limits
+## API limits and access notes
 
-This project uses the `sensorsNearby` method to request several of the nearest public sensors at once. Under narodmon's rules, accessing data from **more than 3 other people's public sensors** requires approval from their technical support team (a request describing how the data is used). By default this device uses up to 5 nearest sensors per parameter across 8 parameter types — the `NEAREST_COUNT` setting in the code can be lowered to 3 to run without separate approval, or you can contact narodmon support with a description of the project (the diagnostic screen is a handy illustration of exactly how the data is used).
-
-Requests are sent no more often than once per minute per key — the API rate limit is respected via the `REQUEST_PERIOD_MIN` setting.
+- **narodmon**: accessing more than 3 other people's public sensors per request requires support approval — this firmware respects the 3-per-request cap by design (`fetchOldestSensors` always queries at most 3 IDs at a time).
+- **Yandex.Weather free tier**: 30 requests/day, forecast limited to today + tomorrow (not tomorrow + day-after, despite how that might sound — `limit=2` in their API means "today and tomorrow"). The adaptive scheduling in this firmware uses roughly 16 requests/day, comfortably under the cap.
 
 ## License
 
@@ -62,4 +63,4 @@ MIT — use, modify, and distribute freely.
 
 ## Acknowledgments
 
-Data provided by the [narodmon.ru](https://narodmon.ru) project — a crowdsourced network of weather and environmental sensors.
+Data provided by [narodmon.ru](https://narodmon.ru) (crowdsourced environmental sensor network) and [Yandex.Weather](https://yandex.ru/dev/weather/).

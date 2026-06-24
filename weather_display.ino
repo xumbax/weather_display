@@ -1,488 +1,640 @@
 /*
  * ============================================================
- *  ПОГОДНЫЙ ДИСПЛЕЙ — ESP32 + ST7789 (240x320)
- *  Берёт N ближайших публичных датчиков каждого типа с narodmon.ru,
- *  усредняет с весами по расстоянию (IDW), показывает карусель.
+ *  WEATHER DISPLAY — ESP32 + ST7789 (240x320)
+ *  v3 — narodmon (oldest-first rotation) + Яндекс.Погода (REST API v2)
  *
- *  Типы датчиков: температура, влажность, давление, скорость ветра,
- *                 направление ветра, радиация, запылённость, осадки
+ *  DATA SOURCES:
+ *    1. narodmon.ru sensorsNearby  — discovers sensor IDs, individual
+ *       per-type radius (10..100 km, +15km hops, stops once 2 sensors
+ *       found per type; a value is shown on screen already at 1 sensor)
+ *    2. narodmon.ru sensorsValues  — picks 3 OLDEST-data sensors among
+ *       all known (up to 24 = 3 per type × 8 types), with a
+ *       5-minute-per-sensor requery guard
+ *    3. Яндекс.Погода REST API v2 (free "smart home" tier) — current
+ *       weather (fact) + nearest hourly forecast to "+2h from request
+ *       time" + 2-day forecast (today + tomorrow only, per the tier's
+ *       documented limit)
  *
- *  ЛОГИКА:
- *    1. При старте — запрос appInit, получаем справочник типов
- *       (код type для каждого названия датчика). НЕ зашиваем числа
- *       руками — народмон не публикует их официально, видим только
- *       из реального ответа.
- *    2. По расписанию (см. ниже) — запрос sensorsNearby с фильтром
- *       по types, получаем все датчики этих типов в радиусе.
- *    3. Группируем по типу, берём NEAREST_COUNT ближайших СВЕЖИХ
- *       (<15 мин) датчиков каждого типа.
- *    4. Взвешенное усреднение: w_i = 1 / (d_i + EPS)^IDW_POWER
- *    5. Карусель из 9 экранов на TFT: температура — всегда первая,
- *       6 обычных параметров, 1 служебный (список ID датчиков).
- *    6. Светодиод — единая иерархия статуса (от грубого к точному):
- *       нет WiFi -> 1с, WiFi есть/нет API -> 3с, API есть/нет датчиков -> 5с,
- *       всё хорошо -> не горит. Погодная тревога перекрывает всё это:
- *       горит непрерывно + пищалка раз в 15 мин (не пищит при проблемах связи).
- *    7. На каждом экране сверху всегда: дата, время, температура.
- *    8. Тренд-индикатор на каждом из 8 параметров: 4 столбика (3ч/1ч/20мин/
- *       сейчас), высота = относительный уровень значения (7 уровней),
- *       не направление изменения. История хранится в RAM на основе
- *       собственных измерений устройства — без лишних запросов к серверу.
- *    9. Защитная перезагрузка: если индикатор непрерывно "мигает"
- *       (проблема WiFi/API/датчиков) дольше 30 минут — ESP.restart().
- *       Тревога погоды и нормальная работа НЕ считаются проблемой.
+ *  CAROUSEL (6 screens):
+ *    0   Temp/Humidity (narodmon)       — large T block + H block
+ *    1   Wind/Direction/Pressure        — 3 blocks (narodmon); direction
+ *        shows current + 1h vector average side by side, plus
+ *        24h/12h/6h prevailing-direction text instead of a trend bar
+ *    2   Air Quality/Radiation/Precip   — 3 blocks (narodmon)
+ *    3   Yandex: at request time + nearest hour to +2h from then
+ *    4   Yandex: 2-day forecast (Today/Tomorrow)
+ *    5   Diagnostics screen
+ *  (no separate full-screen alarm screen — on threshold breach, only
+ *  that parameter's number turns red, LED lights solid while an alarm
+ *  screen is shown, buzzer beeps once per screen display, throttled
+ *  to once every ALARM_BEEP_INTERVAL_SEC across all alarms combined)
  *
- *  РАСПИСАНИЕ ЗАПРОСОВ (для нескольких устройств без коллизий):
- *    Запрос выполняется на минуте M от начала суток (UTC), когда
- *    (M % REQUEST_PERIOD_MIN) == REQUEST_OFFSET_MIN.
- *    Примеры для трёх устройств без пересечений:
- *      Device 1: period=1, offset=0  -> каждую минуту
- *      Device 2: period=2, offset=0  -> минуты 0,2,4,6...
- *      Device 3: period=3, offset=1  -> минуты 1,4,7,10...
- *    Работает одинаково каждые сутки автоматически — это просто
- *    арифметика по модулю от текущего UTC-времени, без необходимости
- *    отдельно отслеживать смену суток.
+ *  TOUCH BUTTON (TTP223): forces screen 0, opens a 30s manual-nav
+ *  window; further taps step through screens and reset the window;
+ *  after 30s of inactivity the normal carousel resumes from wherever
+ *  it was left.
  *
- *  Библиотеки (Library Manager):
- *    - TFT_eSPI         by Bodmer
- *    - ArduinoJson      by Benoit Blanchon (v6)
- *    - NTPClient        by Fabrice Weinberg
+ *  NOTE on TFT_eSPI's built-in font: it has no Cyrillic glyphs, so all
+ *  on-screen text is English. Serial Monitor logs stay in Russian.
  *
- *  ВАЖНО: TFT_eSPI настраивается через User_Setup.h в папке библиотеки,
- *  либо через User_Setup_Select.h — см. файл TFT_eSPI_User_Setup.h
- *  из комплекта, его нужно скопировать в библиотеку.
- *
- *  Лимит API народмона: не чаще 1 запроса/мин с одного ключа.
- *  REQUEST_PERIOD_MIN=1 — это и есть верхний предел частоты.
+ *  Libraries: TFT_eSPI (Bodmer), ArduinoJson v6, NTPClient
  * ============================================================
  */
 
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <NTPClient.h>
-#include <WiFiUdp.h>
+#include <WiFiUDP.h>
 #include <MD5Builder.h>
 #include <TFT_eSPI.h>
 
 // ============================================================
-//  НАСТРОЙКИ — ИЗМЕНИТЕ ПОД СЕБЯ
+//  SETTINGS
 // ============================================================
+const char* WIFI_SSID       = "YOUR_WIFI";
+const char* WIFI_PASS       = "YOUR_PASSWORD";
+const char* NM_UUID_SRC     = "weather-display-01";
+const char* NM_API_KEY      = "YOUR_API_KEY";
 
-const char* WIFI_SSID   = "ВАШ_WIFI";
-const char* WIFI_PASS   = "ВАШ_ПАРОЛЬ";
+// Яндекс.Погода — бесплатный тариф "для умного дома"
+const char* YANDEX_WEATHER_KEY = "YOUR_YANDEX_WEATHER_KEY";
 
-const char* NM_API_KEY  = "ВАШ_API_KEY";       // narodmon.ru → Профиль → Мои приложения
-const char* NM_UUID_SRC = "weather-display-01"; // любая строка → станет MD5
+double MY_LAT = 0.0;   // your latitude  (e.g. 55.7558)
+double MY_LON = 0.0;   // your longitude (e.g. 37.6173)
 
-// Координаты точки наблюдения — ОБЯЗАТЕЛЬНО заменить на свои!
-// Узнать свои координаты можно через Google Maps (клик правой кнопкой на точке)
-double MY_LAT = 0.0;   // широта, например 55.7558
-double MY_LON = 0.0;   // долгота, например 37.6173
+// Display-only timezone offset for the on-screen clock (hours). Does NOT
+// affect any internal calculations — those stay in UTC to match narodmon's
+// "time" field and the request scheduling logic.
+int TZ_DISPLAY_OFFSET_HOURS = 3; // e.g. 3 for Moscow (UTC+3)
 
-// === НАСТРОЙКИ УСРЕДНЕНИЯ (можно менять без перепрошивки логики) ===
-int    NEAREST_COUNT  = 5;     // сколько ближайших датчиков каждого типа брать
-float  IDW_POWER      = 1.0;   // степень затухания веса от расстояния (p)
-float  IDW_EPS        = 0.1;   // защита от деления на 0 при d→0 (км)
-int    SEARCH_RADIUS  = 50;    // радиус поиска датчиков, км
-int    FRESH_MINUTES  = 15;    // датчик считается активным если новее N минут
+// Narodmon sensor discovery
+int    BASE_SEARCH_RADIUS = 10;   // km, starting radius for every type
+int    MAX_SEARCH_RADIUS  = 100;  // km, hard ceiling
+int    RADIUS_STEP_KM     = 15;   // km, шаг расширения за один "хоп"
+int    MIN_SENSORS_TO_STOP_EXPAND = 2; // расширяемся, пока не наберём это число
+int    MIN_SENSORS_NEEDED = 1;    // минимум датчиков для показа значения; N/D только при 0
+int    NEAREST_COUNT      = 3;    // sensors per type to track (max for display)
 
-// === РАСПИСАНИЕ ЗАПРОСОВ (для разводки нескольких устройств) ===
-// Запрос выполняется на минуте M (от начала суток UTC), когда
-// (M % REQUEST_PERIOD_MIN) == REQUEST_OFFSET_MIN.
-// Устройство 1: period=1, offset=0 (каждую минуту)
-// Устройство 2: period=2, offset=0 (минуты 0,2,4,6...)
-// Устройство 3: period=3, offset=1 (минуты 1,4,7,10...)
-int REQUEST_PERIOD_MIN = 1;   // раз в сколько минут запрашивать (1, 2 или 3)
-int REQUEST_OFFSET_MIN = 0;   // сдвиг, чтобы не совпадать с другими устройствами
+// Narodmon rotation scheduling (minute-of-day modulo). Period=1/offset=0
+// means "every minute" — these only matter if you run several devices
+// under one IP and want to stagger their requests to respect the
+// 1-request-per-minute-per-client API limit (e.g. period=2,offset=1 for
+// a second device would make it request on odd minutes only).
+int    REQUEST_PERIOD_MIN = 1;
+int    REQUEST_OFFSET_MIN = 0;
 
-// Карусель экранов
-const int CAROUSEL_INTERVAL_SEC = 6;   // сколько секунд держим экран перед сменой
-// Экран 0 = температура (всегда первый), экраны 1..7 = остальные параметры,
-// экран 8 = служебный (список использованных датчиков)
+// Sensor freshness
+int    FRESH_MINUTES    = 60;   // discard narodmon readings older than this — поднято с 30,
+// так как некоторые соседские датчики (особенно ветер/направление/осадки)
+// сами по себе обновляются редко, раз в 25-30+ минут на своей стороне —
+// при пороге 30 минут это давало систематические N/D даже при честной
+// попытке переопроса с нашей стороны (см. разбор в чате 24.06.2026)
 
-// === ПОРОГИ ТРЕВОГ ===
-const float ALARM_RADIATION_USVH   = 0.30;  // мкЗв/ч, выше — тревога радиации
-const float ALARM_WIND_MS          = 20.0;  // м/с, шторм
-const float ALARM_TEMP_COLD_C      = -30.0; // сильный мороз
-const float ALARM_TEMP_HOT_C       = 35.0;  // сильная жара
-const float ALARM_DUST_UGM3        = 150.0; // мкг/м3 PM2.5/PM10, пылевая буря
+// Минимальный интервал повторного запроса ОДНОГО И ТОГО ЖЕ датчика
+const int MIN_REQUERY_INTERVAL_MIN = 5;
 
-// === ИНДИКАЦИЯ ===
-const int PIN_BUZZER = 25;   // пищалка (активный пьезо или транзисторный ключ)
-const int PIN_LED    = 26;   // светодиод статуса связи + тревоги (см. updateStatusLed)
-const int ALARM_BEEP_INTERVAL_SEC = 15 * 60;  // пищать раз в 15 минут при тревоге
+// IDW averaging
+float  IDW_POWER        = 1.0;
+float  IDW_EPS          = 0.1;  // km, prevents division by zero
+
+// Проверка на "сломанный нулевой" датчик: если в группе 2+ датчика, и один
+// показывает РОВНО 0, а другой отличается от него больше чем на этот порог —
+// нулевой считается сломанным и отбрасывается из усреднения
+float  ZERO_SENSOR_DIFF_THRESHOLD = 1.0;
+
+// Carousel timing
+const int DELAY_SERVICE_SEC  = 4;  // служебный экран — короче остальных
+const int DELAY_NORMAL_SEC   = 8;  // обычные экраны без алерта
+const int DELAY_ALARM_SEC    = 12; // экран с активным алертом — дольше обычного
+
+// Alarms (по отдельным параметрам — красная цифра, не весь экран)
+// ВАЖНО про радиацию: датчики narodmon отдают значение в mR/h (милли-
+// рентген/час), не в мкЗв/ч — используем число как есть, без пересчёта,
+// поэтому порог тоже в этих же единицах (был 0.30 для мкЗв/ч, теперь
+// умножен на 100, как и сами показания датчиков).
+const float ALARM_RADIATION_MRH  = 30.0;   // mR/h
+const float ALARM_WIND_MS        = 20.0;
+const float ALARM_TEMP_COLD_C    = -30.0;
+const float ALARM_TEMP_HOT_C     = 35.0;
+const float ALARM_DUST_UGM3      = 150.0;
+const float ALARM_PRESS_LOW_MMHG = 660.0;
+const float ALARM_PRESS_HIGH_MMHG= 800.0;
+const float ALARM_HUM_HIGH_PCT   = 99.0;
+
+// LED + buzzer
+const int PIN_LED    = 26;
+const int PIN_BUZZER = 25;
+const int PIN_TOUCH_BUTTON = 27; // TTP223, цифровой выход HIGH при касании
+const unsigned long TOUCH_OVERRIDE_TIMEOUT_MS = 30UL * 1000; // 30 секунд
+const int ALARM_BEEP_INTERVAL_SEC = 15 * 60;
 const int ALARM_BEEP_DURATION_MS  = 300;
 
-// TFT пины задаются в TFT_eSPI User_Setup.h, здесь не нужны
+// Watchdog: reboot if stuck in problem state > 30 min
+const unsigned long REBOOT_AFTER_STUCK_SEC = 30 * 60;
+
+// Тренд: см. TREND_SLOT_MINUTES/TREND_SLOT_COUNT в блоке тренд-буфера ниже
 
 // ============================================================
-//  Типы датчиков, которые ищем (название должно точно совпадать
-//  с тем, что вернёт appInit в поле name; регистр важен)
+//  SENSOR TYPE DEFINITIONS (narodmon)
 // ============================================================
-struct SensorTypeConfig {
-  const char* searchName;   // как ищем в справочнике appInit
-  const char* displayName;  // как показываем на экране
-  const char* unit;         // единица для отображения (если не пришла с сервера)
-  int   typeCode;           // код типа — заполняется после appInit, -1 если не найден
-};
-
 enum SensorIndex {
-  S_TEMP = 0, S_HUM, S_PRESS, S_WIND_SPEED, S_WIND_DIR,
+  S_TEMP=0, S_HUM, S_PRESS, S_WIND_SPEED, S_WIND_DIR,
   S_RADIATION, S_DUST, S_PRECIP, S_COUNT
 };
 
+struct SensorTypeConfig {
+  const char* searchName;   // name to match in appInit types[]
+  const char* displayName;  // shown on screen (service screen, logs)
+  const char* shortLabel;   // короткая подпись параметра возле крупной цифры
+  const char* unit;
+  int   typeCode;           // filled by loadSensorTypeCodes()
+};
+
 SensorTypeConfig sensorTypes[S_COUNT] = {
-  { "t воздуха",    "Температура",     "°C",    -1 },
-  { "RH влажность", "Влажность",       "%",     -1 },
-  { "атм.давление", "Давление",        "мм рт.ст.", -1 },
-  { "скорость",     "Скорость ветра",  "м/с",   -1 },
-  { "направление",  "Направление ветра","°",    -1 },
-  { "радиация",     "Радиация",        "мкЗв/ч",-1 },
-  { "запыленность", "Запылённость",    "мкг/м3",-1 },
-  { "осадки",       "Осадки",          "мм",    -1 },
+  { "t воздуха",    "TEMP",     "Temp",  "C"     },
+  { "RH влажность", "HUMIDITY", "Wet",   "%"     },
+  { "атм.давление", "PRESSURE", "Press", "mmHg"  },
+  { "скорость",     "WIND",     "Wind",  "m/s"   },
+  { "направление",  "DIR",      "Dir",   ""      }, // направление выводится словами (N/NE/E...), без размерности
+  { "радиация",     "RADIATION","Rad",   "mR/h"  }, // датчики narodmon отдают mR/h, не uSv/h — используем как есть, без пересчёта
+  { "запыленность", "AIR QUAL", "Air",   "ug/m3" },
+  { "осадки",       "PRECIP",   "Rain",  "mm"    },
 };
 
 // ============================================================
-//  Результат усреднения для одного типа датчика
+//  NARODMON SENSOR ROSTER
 // ============================================================
-const int MAX_USED_SENSORS = 5; // должно быть >= максимально возможного NEAREST_COUNT
+const int MAX_ROSTER = 5;   // >= NEAREST_COUNT
 
-struct UsedSensorInfo {
-  long  id;       // ID датчика в проекте народмон
-  float distance; // км
-  long  time;     // unix time последнего показания
+struct RosterEntry {
+  long  id;
+  float distance;
 };
 
+RosterEntry sensorRoster[S_COUNT][MAX_ROSTER];
+int         rosterCount[S_COUNT] = {0};
+int         searchRadiusByType[S_COUNT];
+
+// ============================================================
+//  NARODMON READING CACHE
+// ============================================================
+struct NmReading {
+  float value;
+  long  time;          // unix UTC показания от сервера; 0 = ещё не получали
+  float dist;           // km, for IDW weight
+  long  lastQueriedTs;  // unix UTC момента, когда МЫ последний раз запросили
+  bool  excludedAsZero; // true если этот датчик отброшен как "сломанный ноль"
+};
+
+NmReading nmCache[S_COUNT][MAX_ROSTER];
+
+// ============================================================
+//  COMPUTED RESULTS (народмон только, IDW-усреднение)
+// ============================================================
 struct SensorResult {
-  bool  valid       = false;  // удалось ли получить хоть один свежий датчик
-  float value       = 0;      // взвешенное среднее
-  int   usedCount    = 0;     // сколько датчиков участвовало
-  float nearestDist  = 0;     // расстояние до самого близкого использованного
-  UsedSensorInfo used[MAX_USED_SENSORS]; // детали по каждому использованному датчику
+  bool  valid       = false;
+  float value       = 0;
+  int   nmCount     = 0;
+  float nearestDist = 0;
+  bool  inAlarm     = false; // этот конкретный параметр сейчас в алерте?
 };
 
 SensorResult results[S_COUNT];
 
+// Forward declarations (определены ниже в файле, но используются раньше)
+void checkPerParameterAlarms();
+void drawCarouselDots(int activeIdx);
+bool screenHasVisibleAlarm(int idx);
 // ============================================================
-//  История значений для тренд-индикатора (3ч / 1ч / 20мин)
-//  Кольцевой буфер в RAM на основе СОБСТВЕННЫХ измерений устройства —
-//  не запрашиваем sensorsHistory у народмона (это умножило бы кол-во
-//  запросов в разы и упёрлось бы в лимит 1/мин).
-//  Глубина буфера рассчитана на худший случай (период=1 мин, нужно
-//  покрыть 3 часа = 180 точек), с запасом.
+//  ТРЕНД-СЛОТЫ — фиксированные временные метки кратные 45 минутам от
+//  начала суток UTC (00:00, 00:45, 01:30, ...), а не "скользящее окно
+//  от текущего момента". Это устраняет рассинхрон между реальным
+//  аптаймом устройства и числом видимых столбиков: раньше тренд искал
+//  точку, ближайшую к "сейчас минус N×15 минут", и если устройство
+//  работало меньше расчётной глубины (7.5ч на 30 слотов), часть
+//  слотов слева физически не могла быть покрыта реальными данными —
+//  то есть число "живых" столбиков на экране оказывалось МЕНЬШЕ
+//  ожидаемого, и тем более могло заметно отставать от количества
+//  реально полученных от narodmon показаний.
+//
+//  Новая схема: каждому параметру соответствует кольцевой буфер на
+//  TREND_SLOT_COUNT=32 слота. При получении нового значения вычисляем
+//  номер слота = (unix_время / (45*60)) — если это новый слот (не тот
+//  же, что был последним записанным) — двигаем "голову" буфера и
+//  записываем туда. Если тот же слот — обновляем значение в нём
+//  (берём последнее известное значение за эти 45 минут).
 // ============================================================
-const int HISTORY_CAPACITY = 200;
+const int TREND_SLOT_MINUTES = 45;
+const int TREND_SLOT_COUNT   = 32; // 32 * 45 мин = 24 часа охвата
 
-struct HistoryPoint {
-  long  time;   // unix time (UTC) измерения
-  float value;  // значение в этот момент
+struct TrendSlot {
+  long  slotIndex = -1; // unix_время/(45*60); -1 = слот ещё не использован
+  float value = 0;
+  bool  valid = false;
 };
 
-struct HistoryBuffer {
-  HistoryPoint points[HISTORY_CAPACITY];
-  int   head  = 0;   // индекс следующей свободной ячейки (циклически)
-  int   count = 0;   // сколько точек реально записано (<= CAPACITY)
+struct TrendBuffer {
+  TrendSlot slots[TREND_SLOT_COUNT];
+  int head = 0; // индекс САМОГО НОВОГО заполненного слота
+  int filledCount = 0; // сколько слотов реально когда-либо заполнено (для лога/диагностики)
 };
 
-HistoryBuffer history[S_COUNT];
+TrendBuffer trendBuf[S_COUNT];
 
-// Добавить новую точку в историю типа idx (вызывается после каждого успешного fetchAndAverage)
-void historyPush(int idx, long time, float value) {
-  HistoryBuffer& h = history[idx];
-  h.points[h.head] = { time, value };
-  h.head = (h.head + 1) % HISTORY_CAPACITY;
-  if (h.count < HISTORY_CAPACITY) h.count++;
+// Добавить новое значение в тренд-буфер параметра idx. Сама определяет,
+// попадает ли новое измерение в уже открытый текущий слот (обновляет
+// его) или нужно открыть новый слот (сдвигает head по кругу).
+void trendPush(int idx, long nowTs, float v) {
+  long slotIdx = nowTs / ((long)TREND_SLOT_MINUTES * 60);
+  TrendBuffer& buf = trendBuf[idx];
+
+  if (buf.filledCount > 0 && buf.slots[buf.head].slotIndex == slotIdx) {
+    // Тот же 45-минутный слот, что и в прошлый раз — просто обновляем значение
+    buf.slots[buf.head].value = v;
+    return;
+  }
+
+  // Новый слот — двигаем голову по кругу и заполняем
+  buf.head = (buf.head + 1) % TREND_SLOT_COUNT;
+  buf.slots[buf.head] = {slotIdx, v, true};
+  if (buf.filledCount < TREND_SLOT_COUNT) buf.filledCount++;
+
+  Serial.printf("  [trend] %s: new slot opened, %d/%d filled\n",
+    sensorTypes[idx].shortLabel, buf.filledCount, TREND_SLOT_COUNT);
 }
 
-// Найти точку из истории, ближайшую по времени к "targetTime".
-// Возвращает false если в буфере вообще нет точек.
-bool historyFindClosest(int idx, long targetTime, float& outValue) {
-  HistoryBuffer& h = history[idx];
-  if (h.count == 0) return false;
+// Для совместимости с остальным кодом (вызывается как раньше из computeResults)
+void historyPush(int idx, long t, float v) {
+  trendPush(idx, t, v);
+}
 
-  long bestDiff = -1;
-  float bestValue = 0;
-  for (int k = 0; k < h.count; k++) {
-    // head указывает на следующую свободную ячейку, т.е. реальные записи лежат
-    // по индексам (head - count) .. (head - 1) по модулю CAPACITY
-    int realIndex = (h.head - 1 - k + HISTORY_CAPACITY) % HISTORY_CAPACITY;
-    long diff = abs((long)(h.points[realIndex].time - targetTime));
-    if (bestDiff < 0 || diff < bestDiff) {
-      bestDiff = diff;
-      bestValue = h.points[realIndex].value;
-    }
+
+// ============================================================
+//  НАПРАВЛЕНИЕ ВЕТРА — почасовые векторы (вместо тренд-бара, который
+//  для категориальной величины визуально бессмысленен и "дёргался").
+//  Векторная сумма направлений за период вместо обычного среднего —
+//  иначе 350° и 10° усреднились бы в 180° (юг), что физически неверно.
+//  Оптимизация: считаем не по всей сырой истории каждый раз, а
+//  накапливаем ОДИН вектор на ТЕКУЩИЙ час, и при переходе на новый
+//  час "закрываем" его в кольцевой буфер на 24 часа. Запрос за
+//  1ч/6ч/12ч/24ч — это просто сумма последних N закрытых часов
+//  (+ текущий открытый для 1ч), O(N) вместо пересчёта всей истории.
+// ============================================================
+struct WindDirHourVector {
+  float sumX = 0, sumY = 0; // сумма единичных векторов направления за этот час
+  int   count = 0;          // сколько измерений вошло (для информации/отладки)
+  bool  valid = false;
+};
+
+const int WIND_DIR_HOURS = 24;
+WindDirHourVector windDirHourly[WIND_DIR_HOURS]; // кольцевой буфер закрытых часов
+int  windDirHourlyHead = 0; // индекс следующего слота для записи (циклически)
+long windDirCurrentHourStart = 0; // unix UTC начала ТЕКУЩЕГО (открытого) часа
+WindDirHourVector windDirCurrentHour; // накопитель текущего часа, ещё не закрытого
+
+// Добавить новое измерение направления ветра (вызывается из computeResults,
+// синхронно с обновлением trendBuf[S_WIND_DIR]). Сама решает, нужно ли
+// "закрыть" предыдущий час и начать новый.
+void windDirAddSample(long nowTs, float degrees) {
+  long hourStart = (nowTs / 3600) * 3600;
+
+  if (windDirCurrentHourStart == 0) {
+    windDirCurrentHourStart = hourStart; // первый запуск
+  } else if (hourStart != windDirCurrentHourStart) {
+    // Перешли в новый час — закрываем предыдущий накопитель в буфер
+    windDirHourly[windDirHourlyHead] = windDirCurrentHour;
+    windDirHourlyHead = (windDirHourlyHead + 1) % WIND_DIR_HOURS;
+    windDirCurrentHour = WindDirHourVector(); // сброс накопителя
+    windDirCurrentHourStart = hourStart;
   }
-  outValue = bestValue;
+
+  float rad = radians(degrees);
+  windDirCurrentHour.sumX += cos(rad);
+  windDirCurrentHour.sumY += sin(rad);
+  windDirCurrentHour.count++;
+  windDirCurrentHour.valid = true;
+}
+
+// Преобладающее направление за последние N часов (включая текущий открытый
+// час). Возвращает false если вообще нет данных за этот период.
+bool windDirPrevailing(int hoursBack, float& outDegrees) {
+  float sumX = windDirCurrentHour.sumX, sumY = windDirCurrentHour.sumY;
+  bool any = windDirCurrentHour.valid;
+
+  // Закрытые часы, от самого свежего назад: индекс (head-1), (head-2), ...
+  for (int k = 0; k < hoursBack && k < WIND_DIR_HOURS; k++) {
+    int idx = (windDirHourlyHead - 1 - k + WIND_DIR_HOURS) % WIND_DIR_HOURS;
+    if (!windDirHourly[idx].valid) continue;
+    sumX += windDirHourly[idx].sumX;
+    sumY += windDirHourly[idx].sumY;
+    any = true;
+  }
+
+  if (!any || (fabs(sumX) < 0.0001f && fabs(sumY) < 0.0001f)) return false;
+
+  float deg = degrees(atan2(sumY, sumX));
+  if (deg < 0) deg += 360.0f;
+  outDegrees = deg;
   return true;
 }
 
 // ============================================================
-//  Глобальные объекты
+//  YANDEX WEATHER — REST API v2, бесплатный тариф "для умного дома".
+//  Подтверждённые рабочим логом поля: temp, feels_like, wind_speed,
+//  condition (fact); почасовой forecasts[].hours[] для +2h-слота;
+//  parts.day/night.temp_avg для 2-дневного прогноза.
+// ============================================================
+struct YandexNow {
+  bool  valid = false;
+  float temperature;
+  float feelsLike;
+  float windSpeed;
+  String condition; // приходит от сервера на русском — на экране не выводится (нет кириллицы в шрифте)
+  long  fetchedAtTs = 0; // unix UTC момента запроса — используется для подписи "AT HH:MM" на экране
+};
+YandexNow yandexNow;
+
+struct YandexHour {
+  bool  valid = false;
+  long  time;       // unix UTC этого часового слота
+  float temperature;
+  float windSpeed;
+  String condition;
+};
+// Слот "через 2 часа от текущего момента" — один, не массив,
+// перевыбирается из ответа при каждом обновлении
+YandexHour yandexPlus2h;
+
+struct YandexDay {
+  bool  valid = false;
+  float tempDay;        // средняя дневная (parts.day.temp_avg)
+  float tempNight;      // средняя ночная (parts.night.temp_avg)
+};
+YandexDay yandexDays[2]; // [0] = сегодня, [1] = завтра
+
+unsigned long bootMillis = 0;
+bool firstYandexFetchDone = false;
+// Первый запрос к Яндексу — не сразу при включении, а через 5 минут
+// (даёт время устройству спокойно подключиться к WiFi/NTP и не плодить
+// лишний сетевой трафик в первые секунды после старта)
+const unsigned long YANDEX_STARTUP_DELAY_MS = 5UL * 60 * 1000;
+bool yandexReachable = false;
+
+// ============================================================
+//  АДАПТИВНОЕ РАСПИСАНИЕ запросов к Яндексу: вместо фиксированного
+//  интервала — следующий запрос ровно за 30 минут до того, как
+//  истекает актуальность текущего прогнозного слота "+2 часа"
+//  (yandexPlus2h.time). Пример: запрос в 1:18 -> слот на 3:00 ->
+//  следующий запрос в 2:30 -> новый слот на 4:00 -> запрос в 3:30...
+//  Шаг между запросами получается ~1.5 часа (с учётом округления до
+//  целого часа), это ~16 запросов/сутки — в пределах лимита 30/сутки.
+//  При неудачном запросе (нет сети/ошибка) — повтор через 30 минут,
+//  а не по обычному расписанию.
+// ============================================================
+const int YANDEX_PRE_EXPIRY_MIN = 30; // запрашиваем заранее, за столько минут
+const int YANDEX_RETRY_AFTER_FAIL_MIN = 30; // повтор при неудаче — через сколько минут
+long nextYandexFetchTs = 0; // unix UTC момента следующего запроса (0 = ещё не назначен)
+
+// ============================================================
+//  GLOBALS
 // ============================================================
 TFT_eSPI tft = TFT_eSPI();
-WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 60000); // чистый UTC
-String nmUUID;
+WiFiUDP  ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 60000);
+String   nmUUID;
 
-int  carouselIndex = 0;            // 0 = температура, дальше остальные, последний = служебный
+// Scheduling
+long  lastRequestMinute   = -1;
+long  lastNearbyHour      = -1;  // hour-of-day of last sensorsNearby call (0/6/12/18)
+
+unsigned long lastFastExpandCheck = 0;
+const unsigned long FAST_EXPAND_INTERVAL_MS = 2UL * 60 * 1000; // 2 минуты
+
+// Carousel
+int  carouselIndex = 0;
 unsigned long lastCarouselSwitch = 0;
-long lastRequestMinute = -1;       // минута суток (UTC) последнего выполненного запроса
-unsigned long lastAlarmBeep      = 0;
-bool alarmActive  = false;
+
+// TTP223 сенсорная кнопка: принудительное управление каруселью.
+// При касании — переход на следующий экран (или экран 0, если override
+// ещё не активен) и 30-секундный таймер; новое касание внутри этого окна
+// двигает дальше и сбрасывает таймер. По истечении 30с без касаний —
+// обычная автокарусель продолжает с текущего экрана.
+bool touchOverrideActive = false;
+unsigned long touchOverrideUntil = 0;
+bool lastTouchPinState = false; // для детектирования фронта (debounce)
+unsigned long lastTouchChangeMs = 0;
+const unsigned long TOUCH_DEBOUNCE_MS = 50;
+const int TOTAL_SCREENS = 6; // см. список экранов в шапке файла
+
+// Alarm + LED (теперь алерт — это свойство КОНКРЕТНОГО параметра, не всего экрана)
+bool anyAlarmActive = false; // хоть один параметр сейчас в алерте?
+unsigned long lastAlarmBeep = 0;
 bool ledBlinkState = false;
 unsigned long lastLedBlink = 0;
+unsigned long problemStateSince = 0;
 
-// === Статус связи для индикации светодиодом (заполняется в fetchAndAverage) ===
-bool apiReachable   = false;  // последний запрос к народмону дошёл и распарсился без ошибки
-bool anySensorFound  = false;  // хотя бы один датчик хотя бы одного типа дал валидный результат
-bool typeCodesLoaded = false;  // справочник типов (appInit) успешно загружен хотя бы раз
-
-// === Защитный таймаут: если индикатор непрерывно "мигает" (проблема связи/
-//    API/датчиков, не "всё хорошо" и не "тревога") дольше REBOOT_AFTER_STUCK_SEC —
-//    перезагружаемся. Лечит зависания WiFi-стека/памяти лучше внутренних ретраев.
-const unsigned long REBOOT_AFTER_STUCK_SEC = 30 * 60; // 30 минут
-unsigned long problemStateSince = 0;  // millis() момента, когда впервые увидели проблему; 0 = сейчас всё ок
-
-// Список активных тревог (для отображения текста на экране)
-String activeAlarmText = "";
-
+// Status flags
+bool apiReachable    = false;
+bool anySensorFound  = false;
+bool typeCodesLoaded = false;
 // ============================================================
-//  Проверка расписания: пора ли делать запрос на текущей минуте?
-//  Минута считается от начала суток UTC: 0..1439
+//  UTILITIES
 // ============================================================
+String md5String(const String& s) {
+  MD5Builder m; m.begin(); m.add(s); m.calculate(); return m.toString();
+}
+
 bool isScheduledMinuteNow() {
   long nowTs = (long)timeClient.getEpochTime();
-  long minuteOfDay = (nowTs / 60) % 1440;
+  long mn = (nowTs / 60) % 1440;
+  if (mn == lastRequestMinute) return false;
+  int p = max(1, REQUEST_PERIOD_MIN);
+  if ((mn % p) == (REQUEST_OFFSET_MIN % p)) { lastRequestMinute = mn; return true; }
+  return false;
+}
 
-  if (minuteOfDay == lastRequestMinute) return false; // уже делали запрос в эту минуту
+// True if sensorsNearby should run now (every 6h at 0,6,12,18 UTC)
+bool isNearbyRefreshDue() {
+  long nowTs = (long)timeClient.getEpochTime();
+  long hourOfDay = (nowTs / 3600) % 24;
+  long nearbySlot = (hourOfDay / 6) * 6;
+  if (nearbySlot == lastNearbyHour) return false;
+  lastNearbyHour = nearbySlot; return true;
+}
 
-  int period = max(1, REQUEST_PERIOD_MIN); // защита от 0
-  int offset = REQUEST_OFFSET_MIN % period;
-
-  if ((minuteOfDay % period) == offset) {
-    lastRequestMinute = minuteOfDay;
-    return true;
+// True if any sensor type still has too few sensors AND hasn't hit the
+// radius ceiling yet — used to drive the fast (2-min) expansion cycle.
+bool anyTypeNeedsExpansion() {
+  for (int i = 0; i < S_COUNT; i++) {
+    if (rosterCount[i] < MIN_SENSORS_TO_STOP_EXPAND && searchRadiusByType[i] < MAX_SEARCH_RADIUS)
+      return true;
   }
   return false;
 }
 
 // ============================================================
-//  MD5
-// ============================================================
-String md5String(const String& s) {
-  MD5Builder md5;
-  md5.begin();
-  md5.add(s);
-  md5.calculate();
-  return md5.toString();
-}
-
-// ============================================================
-//  WiFi
-//  Не перезагружает плату при неудаче — возвращает управление в loop(),
-//  чтобы продолжали работать индикация и карусель (с "нет данных").
-//  Мигает светодиодом раз в секунду во время попытки подключения.
+//  WIFI
 // ============================================================
 void connectWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("WiFi подключение");
+  WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID, WIFI_PASS);
   unsigned long start = millis();
-  unsigned long lastBlink = 0;
-  bool blinkState = false;
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-    if (millis() - lastBlink > 500) {
-      blinkState = !blinkState;
-      digitalWrite(PIN_LED, blinkState ? HIGH : LOW);
-      lastBlink = millis();
-    }
+  unsigned long lastBlink = 0; bool blinkSt = false;
+  while (WiFi.status() != WL_CONNECTED && millis()-start < 15000) {
+    if (millis()-lastBlink > 500) { blinkSt=!blinkSt; digitalWrite(PIN_LED,blinkSt); lastBlink=millis(); }
     delay(50);
   }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println(" OK  IP: " + WiFi.localIP().toString());
-  } else {
-    Serial.println(" пока не подключено, попробуем позже");
-  }
+  if (WiFi.status() == WL_CONNECTED)
+    Serial.println("WiFi OK  " + WiFi.localIP().toString());
+  else
+    Serial.println("WiFi FAIL — will retry");
 }
 
 // ============================================================
-//  HTTP POST запрос к narodmon API, возвращает тело ответа
+//  HTTP helpers — поддерживают и http:// (narodmon), и https://
+//  (Яндекс). На ESP32 Arduino Core 3.x статический переживающий
+//  WiFiClientSecure + явные таймауты + задержка после неудачи —
+//  обходит известную проблему CONNECTION_REFUSED (-1).
 // ============================================================
-String narodmonRequest(const String& body) {
-  WiFiClient client;
+String httpGet(const String& url, const char* extraHeaderName = nullptr, const char* extraHeaderValue = nullptr) {
   HTTPClient http;
-  http.begin(client, "http://narodmon.ru/api");
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("User-Agent", "ESP32WeatherDisplay");
-  int code = http.POST(body);
-  String resp = "";
-  if (code == 200) {
-    resp = http.getString();
+  int code = -1;
+  String r;
+
+  if (url.startsWith("https://")) {
+    static WiFiClientSecure secureClient;
+    secureClient.setInsecure();
+    secureClient.setTimeout(15000);
+    http.setConnectTimeout(15000);
+    http.setTimeout(15000);
+    if (http.begin(secureClient, url)) {
+      http.addHeader("User-Agent","ESP32WeatherDisplay");
+      if (extraHeaderName) http.addHeader(extraHeaderName, extraHeaderValue);
+      code = http.GET();
+      r = (code == 200) ? http.getString() : "";
+    }
+    if (code <= 0) delay(200);
   } else {
-    Serial.printf("HTTP код: %d\n", code);
+    WiFiClient client;
+    http.setConnectTimeout(10000);
+    http.begin(client, url);
+    http.addHeader("User-Agent","ESP32WeatherDisplay");
+    if (extraHeaderName) http.addHeader(extraHeaderName, extraHeaderValue);
+    code = http.GET();
+    r = (code == 200) ? http.getString() : "";
   }
+
   http.end();
-  return resp;
+  if (code != 200) Serial.printf("HTTP GET %d: %s\n", code, url.c_str());
+  return r;
 }
 
+String nmPost(const String& body) {
+  WiFiClient client; HTTPClient http;
+  http.begin(client, "http://narodmon.ru/api");
+  http.addHeader("Content-Type","application/json");
+  http.addHeader("User-Agent","ESP32WeatherDisplay");
+  int code = http.POST(body);
+  String r = (code == 200) ? http.getString() : "";
+  http.end();
+  return r;
+}
 // ============================================================
-//  appInit — получить справочник типов датчиков, заполнить
-//  sensorTypes[].typeCode по совпадению имени
+//  appInit — get sensor type codes by name
 // ============================================================
 bool loadSensorTypeCodes() {
   String body = "{\"cmd\":\"appInit\",\"version\":\"1.0\",\"uuid\":\"" + nmUUID +
-                "\",\"api_key\":\"" + String(NM_API_KEY) + "\",\"lang\":\"ru\"}";
-
-  Serial.println("Запрос appInit (справочник типов)...");
-  String resp = narodmonRequest(body);
-  if (resp.length() == 0) {
-    Serial.println("appInit: пустой ответ");
-    return false;
-  }
-
+                "\",\"api_key\":\"" + NM_API_KEY + "\",\"lang\":\"ru\"}";
+  String resp = nmPost(body);
+  if (!resp.length()) return false;
   DynamicJsonDocument doc(8192);
-  DeserializationError err = deserializeJson(doc, resp);
-  if (err) {
-    Serial.println("appInit JSON ошибка: " + String(err.c_str()));
-    return false;
-  }
-  if (doc.containsKey("error")) {
-    Serial.println("appInit ошибка сервера: " + String(doc["error"].as<const char*>()));
-    return false;
-  }
-
+  if (deserializeJson(doc, resp) || doc.containsKey("error")) return false;
   JsonArray types = doc["types"].as<JsonArray>();
-  Serial.printf("Справочник типов получен: %d записей\n", types.size());
-
-  // Для каждого нашего искомого типа ищем совпадение по имени
   for (int i = 0; i < S_COUNT; i++) {
     sensorTypes[i].typeCode = -1;
     for (JsonObject t : types) {
-      const char* name = t["name"];
-      if (name && String(name) == String(sensorTypes[i].searchName)) {
+      if (String(t["name"].as<const char*>()) == String(sensorTypes[i].searchName)) {
         sensorTypes[i].typeCode = t["type"].as<int>();
         Serial.printf("  %s -> type=%d\n", sensorTypes[i].displayName, sensorTypes[i].typeCode);
         break;
       }
-    }
-    if (sensorTypes[i].typeCode == -1) {
-      Serial.printf("  ВНИМАНИЕ: тип \"%s\" не найден в справочнике!\n", sensorTypes[i].searchName);
     }
   }
   return true;
 }
 
 // ============================================================
-//  Гаверсинус — расстояние между двумя точками на сфере (км)
-//  (используется как запасной вариант, если сервер не вернул distance)
+//  sensorsNearby — discover sensor IDs and build roster.
+//
+//  expandHungryOnly=true (быстрый цикл, 2 мин): запрашиваем ТОЛЬКО типы,
+//    у которых ещё меньше MIN_SENSORS_TO_STOP_EXPAND датчиков, с радиусом
+//    +RADIUS_STEP_KM от текущего. Останавливаемся, как только наберётся
+//    MIN_SENSORS_TO_STOP_EXPAND (по умолчанию 2) — дальше не расширяем,
+//    хотя НА ЭКРАНЕ значение показывается уже при MIN_SENSORS_NEEDED=1.
+//  expandHungryOnly=false (обычный цикл, 6 часов): все 8 типов, текущие
+//    радиусы; если у типа >=4 датчика — сужаем радиус обратно к базовому.
 // ============================================================
-float haversineKm(double lat1, double lon1, double lat2, double lon2) {
-  const double R = 6371.0;
-  double dLat = radians(lat2 - lat1);
-  double dLon = radians(lon2 - lon1);
-  double a = sin(dLat/2)*sin(dLat/2) + cos(radians(lat1))*cos(radians(lat2))*sin(dLon/2)*sin(dLon/2);
-  double c = 2 * atan2(sqrt(a), sqrt(1-a));
-  return (float)(R * c);
-}
 
-// ============================================================
-//  Структура для сбора кандидатов одного типа перед усреднением
-// ============================================================
-struct Candidate {
-  long  id;
-  float distance;
-  float value;
-  long  time;
-};
-
-// ============================================================
-//  sensorsNearby — запросить все типы сразу, распарсить,
-//  для каждого типа найти NEAREST_COUNT ближайших свежих,
-//  посчитать взвешенное среднее (IDW)
-// ============================================================
-void fetchAndAverage() {
-  // Собираем список найденных типов в массив для фильтра
+void refreshSensorRoster(bool expandHungryOnly) {
   String typesList = "[";
   bool first = true;
+  int requestRadius = BASE_SEARCH_RADIUS;
+
   for (int i = 0; i < S_COUNT; i++) {
     if (sensorTypes[i].typeCode < 0) continue;
+    bool hungry = (rosterCount[i] < MIN_SENSORS_TO_STOP_EXPAND);
+
+    if (expandHungryOnly && !hungry) continue;
+
     if (!first) typesList += ",";
     typesList += String(sensorTypes[i].typeCode);
     first = false;
+
+    int r = searchRadiusByType[i];
+    if (expandHungryOnly && hungry) r = min(r + RADIUS_STEP_KM, MAX_SEARCH_RADIUS);
+    if (r > requestRadius) requestRadius = r;
+  }
+
+  if (first) {
+    Serial.println("refreshSensorRoster: no types to query (nothing hungry), skipping");
+    return;
   }
   typesList += "]";
 
-  if (typesList == "[]") {
-    Serial.println("Нет ни одного известного типа датчика — пропускаем запрос");
-    return;
-  }
+  Serial.printf("sensorsNearby: %s mode, radius %d km, types=%s\n",
+    expandHungryOnly ? "FAST-EXPAND" : "FULL-REVIEW", requestRadius, typesList.c_str());
 
   String body = "{\"cmd\":\"sensorsNearby\","
-                "\"lat\":" + String(MY_LAT, 6) + ","
-                "\"lon\":" + String(MY_LON, 6) + ","
-                "\"radius\":" + String(SEARCH_RADIUS) + ","
-                "\"pub\":1,"
-                "\"types\":" + typesList + ","
-                "\"uuid\":\"" + nmUUID + "\","
-                "\"api_key\":\"" + String(NM_API_KEY) + "\","
-                "\"lang\":\"ru\"}";
+    "\"lat\":" + String(MY_LAT,6) + ",\"lon\":" + String(MY_LON,6) + ","
+    "\"radius\":" + String(requestRadius) + ",\"pub\":1,"
+    "\"types\":" + typesList + ","
+    "\"uuid\":\"" + nmUUID + "\",\"api_key\":\"" + NM_API_KEY + "\","
+    "\"lang\":\"ru\"}";
 
-  Serial.println("Запрос sensorsNearby...");
-  String resp = narodmonRequest(body);
-  if (resp.length() == 0) {
-    Serial.println("sensorsNearby: пустой ответ (нет сети?)");
-    apiReachable = false;
-    return;
-  }
+  String resp = nmPost(body);
+  if (!resp.length()) { Serial.println("sensorsNearby: no response"); return; }
 
   DynamicJsonDocument doc(32768);
-  DeserializationError err = deserializeJson(doc, resp);
-  if (err) {
-    Serial.println("sensorsNearby JSON ошибка: " + String(err.c_str()));
-    apiReachable = false;
-    return;
-  }
-  if (doc.containsKey("error")) {
-    Serial.println("sensorsNearby ошибка сервера: " + String(doc["error"].as<const char*>()));
-    apiReachable = false;
-    return;
+  if (deserializeJson(doc, resp) || doc.containsKey("error")) {
+    Serial.println("sensorsNearby: error"); return;
   }
 
-  // Дошли до сюда — народмон ответил и тело распарсилось без ошибок
-  apiReachable = true;
+  struct Cand { long id; float dist; };
+  Cand cands[S_COUNT][40]; int candCnt[S_COUNT] = {0};
 
-  JsonArray devices = doc["devices"].as<JsonArray>();
-  Serial.printf("Устройств в ответе: %d\n", devices.size());
-
-  long nowTs = (long)timeClient.getEpochTime();
-
-  // Для каждого нашего типа — список кандидатов
-  static Candidate candidates[S_COUNT][40]; // максимум 40 кандидатов на тип, более чем достаточно
-  int candidateCount[S_COUNT] = {0};
-
-  for (JsonObject dev : devices) {
-    float devDistance = dev["distance"].as<float>();
-    JsonArray sensors = dev["sensors"].as<JsonArray>();
-    for (JsonObject s : sensors) {
+  for (JsonObject dev : doc["devices"].as<JsonArray>()) {
+    float dist = dev["distance"].as<float>();
+    for (JsonObject s : dev["sensors"].as<JsonArray>()) {
       int type = s["type"].as<int>();
-      long sTime = s["time"].as<long>();
-      float sValue = s["value"].as<float>();
-      long sId = s["id"].as<long>();
-
-      // Свежесть
-      long ageMin = (nowTs - sTime) / 60;
-      if (ageMin > FRESH_MINUTES || ageMin < -2) continue; // -2 допуск на дрейф часов
-
-      // Найти к какому из наших индексов относится этот type
+      long sid  = s["id"].as<long>();
       for (int i = 0; i < S_COUNT; i++) {
         if (sensorTypes[i].typeCode == type) {
-          if (candidateCount[i] < 40) {
-            candidates[i][candidateCount[i]].id       = sId;
-            candidates[i][candidateCount[i]].distance = devDistance;
-            candidates[i][candidateCount[i]].value    = sValue;
-            candidates[i][candidateCount[i]].time     = sTime;
-            candidateCount[i]++;
+          bool hungry = (rosterCount[i] < MIN_SENSORS_TO_STOP_EXPAND);
+          int effectiveRadius = searchRadiusByType[i];
+          if (expandHungryOnly && hungry) effectiveRadius = min(effectiveRadius + RADIUS_STEP_KM, MAX_SEARCH_RADIUS);
+          if (dist <= effectiveRadius && candCnt[i] < 40) {
+            cands[i][candCnt[i]++] = {sid, dist};
           }
           break;
         }
@@ -490,159 +642,370 @@ void fetchAndAverage() {
     }
   }
 
-  // Для каждого типа: отсортировать по расстоянию, взять NEAREST_COUNT, усреднить с IDW
   for (int i = 0; i < S_COUNT; i++) {
-    int n = candidateCount[i];
-    if (n == 0) {
-      results[i].valid = false;
-      Serial.printf("%s: нет свежих публичных датчиков в радиусе\n", sensorTypes[i].displayName);
-      continue;
+    if (sensorTypes[i].typeCode < 0) continue;
+    bool wasQueried = !expandHungryOnly || (rosterCount[i] < MIN_SENSORS_TO_STOP_EXPAND);
+    if (!wasQueried) continue;
+
+    for (int a=0;a<candCnt[i]-1;a++) for (int b=0;b<candCnt[i]-1-a;b++)
+      if (cands[i][b].dist > cands[i][b+1].dist) { Cand tmp=cands[i][b]; cands[i][b]=cands[i][b+1]; cands[i][b+1]=tmp; }
+
+    int newCount = min(candCnt[i], NEAREST_COUNT);
+    rosterCount[i] = newCount;
+    for (int k=0; k<newCount; k++) {
+      sensorRoster[i][k] = {cands[i][k].id, cands[i][k].dist};
+      bool found = false;
+      for (int p=0; p<MAX_ROSTER; p++)
+        if (nmCache[i][p].time > 0 && sensorRoster[i][k].id == sensorRoster[i][k].id) { found=true; break; }
+      if (!found) nmCache[i][k] = {0, 0, cands[i][k].dist, 0, false};
     }
 
-    // Простая сортировка по расстоянию (n мало, пузырьком достаточно)
-    for (int a = 0; a < n - 1; a++) {
-      for (int b = 0; b < n - 1 - a; b++) {
-        if (candidates[i][b].distance > candidates[i][b+1].distance) {
-          Candidate tmp = candidates[i][b];
-          candidates[i][b] = candidates[i][b+1];
-          candidates[i][b+1] = tmp;
+    if (expandHungryOnly) {
+      if (newCount < MIN_SENSORS_TO_STOP_EXPAND && searchRadiusByType[i] < MAX_SEARCH_RADIUS) {
+        int oldR = searchRadiusByType[i];
+        searchRadiusByType[i] = min(searchRadiusByType[i] + RADIUS_STEP_KM, MAX_SEARCH_RADIUS);
+        Serial.printf("  %s: %d sensors (< %d needed to stop), radius %d -> %d km\n",
+          sensorTypes[i].displayName, newCount, MIN_SENSORS_TO_STOP_EXPAND, oldR, searchRadiusByType[i]);
+      } else {
+        Serial.printf("  %s: %d sensors, radius stays %d km\n",
+          sensorTypes[i].displayName, newCount, searchRadiusByType[i]);
+      }
+    } else {
+      if (newCount >= 4 && searchRadiusByType[i] > BASE_SEARCH_RADIUS) {
+        int oldR = searchRadiusByType[i];
+        searchRadiusByType[i] = BASE_SEARCH_RADIUS;
+        Serial.printf("  %s: %d sensors (>=4, запас есть), radius %d -> %d km (сужаем)\n",
+          sensorTypes[i].displayName, newCount, oldR, searchRadiusByType[i]);
+      } else {
+        Serial.printf("  %s: %d sensors, radius stays %d km\n",
+          sensorTypes[i].displayName, newCount, searchRadiusByType[i]);
+      }
+    }
+  }
+
+  int totalKnown = 0;
+  for (int i=0; i<S_COUNT; i++) totalKnown += rosterCount[i];
+  Serial.printf("Total known sensors: %d\n", totalKnown);
+}
+
+// ============================================================
+//  sensorsValues — выбираем 3 датчика с самыми старыми показаниями
+//  (датчики без данных вообще — "максимально старые", приоритет выше всех).
+//  Защита: не переспрашиваем один датчик чаще раза в MIN_REQUERY_INTERVAL_MIN.
+// ============================================================
+void fetchOldestSensors() {
+  long nowTs = (long)timeClient.getEpochTime();
+
+  struct Candidate { int typeIdx; int rosterIdx; long sortAge; };
+  Candidate all[S_COUNT * MAX_ROSTER];
+  int allCount = 0;
+
+  for (int i = 0; i < S_COUNT; i++) {
+    for (int k = 0; k < rosterCount[i]; k++) {
+      NmReading& r = nmCache[i][k];
+      if (r.lastQueriedTs > 0 && (nowTs - r.lastQueriedTs) < MIN_REQUERY_INTERVAL_MIN * 60L)
+        continue;
+      long sortAge = (r.time == 0) ? LONG_MAX : (nowTs - r.time);
+      all[allCount++] = {i, k, sortAge};
+    }
+  }
+
+  if (allCount == 0) {
+    Serial.println("fetchOldestSensors: nothing eligible right now (all queried <5 min ago)");
+    return;
+  }
+
+  for (int a=1; a<allCount; a++) {
+    Candidate key = all[a]; int b = a-1;
+    while (b>=0 && all[b].sortAge < key.sortAge) { all[b+1]=all[b]; b--; }
+    all[b+1] = key;
+  }
+
+  int n = min(allCount, 3);
+  long ids[3]; int typeIdxs[3]; int rosterIdxs[3];
+  for (int k=0; k<n; k++) {
+    typeIdxs[k] = all[k].typeIdx;
+    rosterIdxs[k] = all[k].rosterIdx;
+    ids[k] = sensorRoster[typeIdxs[k]][rosterIdxs[k]].id;
+    nmCache[typeIdxs[k]][rosterIdxs[k]].lastQueriedTs = nowTs;
+  }
+
+  String idsStr = "[";
+  for (int k=0; k<n; k++) { if (k) idsStr+=","; idsStr += String(ids[k]); }
+  idsStr += "]";
+
+  String body = "{\"cmd\":\"sensorsValues\",\"sensors\":" + idsStr +
+    ",\"uuid\":\"" + nmUUID + "\",\"api_key\":\"" + NM_API_KEY + "\",\"lang\":\"ru\"}";
+
+  String resp = nmPost(body);
+  if (!resp.length()) { apiReachable = false; return; }
+
+  StaticJsonDocument<1024> doc;
+  if (deserializeJson(doc, resp) || doc.containsKey("error")) { apiReachable = false; return; }
+  apiReachable = true;
+
+  JsonArray sensors = doc["sensors"].as<JsonArray>();
+  for (JsonObject s : sensors) {
+    long sid = s["id"].as<long>();
+    float val = s["value"].as<float>();
+    long  t   = s["time"].as<long>();
+    long ageMin = (nowTs - t) / 60;
+    if (ageMin > FRESH_MINUTES || ageMin < -2) continue;
+
+    for (int k=0; k<n; k++) {
+      if (sensorRoster[typeIdxs[k]][rosterIdxs[k]].id == sid) {
+        nmCache[typeIdxs[k]][rosterIdxs[k]].value = val;
+        nmCache[typeIdxs[k]][rosterIdxs[k]].time = t;
+        Serial.printf("  cached %s[%d] = %.2f (age %ldm)\n",
+          sensorTypes[typeIdxs[k]].displayName, rosterIdxs[k], val, ageMin);
+        break;
+      }
+    }
+  }
+}
+// ============================================================
+//  YANDEX WEATHER — REST API v2 (тариф "для умного дома" / "Оптимальный")
+//  Эндпоинт: GET https://api.weather.yandex.ru/v2/forecast?lat=..&lon=..&hours=true
+//  Заголовок: X-Yandex-Weather-Key: <ключ>
+//
+//  Структура ответа (подтверждена официальной документацией):
+//    { "now": unixTs, "now_dt": "ISO8601",
+//      "info": {...},
+//      "fact": { temp, feels_like, icon, condition, wind_speed,
+//                wind_gust, wind_dir, pressure_mm, pressure_pa, humidity },
+//      "forecasts": [ { date, date_ts, hours: [ {hour, hour_ts, temp,
+//                        wind_speed, wind_dir, pressure_mm, condition}, ... ],
+//                        parts: { day: {temp_avg,...}, night: {...} } }, ... ] }
+//
+//  ВНИМАНИЕ: на бесплатном тарифе "для умного дома" набор полей может
+//  быть урезан (например давление/влажность могут отсутствовать) —
+//  код проверяет наличие каждого поля отдельно (isNull()), пропуская
+//  то, чего нет, вместо падения. Если структура всё же отличается от
+//  документации — Serial Monitor покажет сырой ответ при ошибке парсинга.
+// ============================================================
+void fetchYandexWeather() {
+  if (MY_LAT == 0.0 && MY_LON == 0.0) return;
+  Serial.println("Fetching Yandex Weather...");
+
+  String url = "https://api.weather.yandex.ru/v2/forecast"
+    "?lat=" + String(MY_LAT, 6) + "&lon=" + String(MY_LON, 6) +
+    "&lang=ru_RU&limit=2&hours=true&extra=false";
+
+  String resp = httpGet(url, "X-Yandex-Weather-Key", YANDEX_WEATHER_KEY);
+
+  if (!resp.length()) {
+    Serial.println("Yandex Weather: no response");
+    yandexReachable = false;
+    return;
+  }
+
+  DynamicJsonDocument doc(24576);
+  DeserializationError err = deserializeJson(doc, resp);
+  if (err) {
+    Serial.println("Yandex Weather: JSON parse error: " + String(err.c_str()));
+    Serial.println("Raw response (first 600 chars): " + resp.substring(0, 600));
+    yandexReachable = false;
+    return;
+  }
+
+  if (doc.containsKey("errors") || doc.containsKey("error")) {
+    Serial.println("Yandex Weather: error in response:");
+    Serial.println(resp.substring(0, 400));
+    yandexReachable = false;
+    return;
+  }
+
+  JsonObject fact = doc["fact"];
+  if (fact.isNull()) {
+    Serial.println("Yandex Weather: no 'fact' in response — структура ответа другая,");
+    Serial.println("проверьте заголовок (X-Yandex-Weather-Key vs X-Yandex-API-Key) и тариф.");
+    Serial.println("Raw response (first 600 chars): " + resp.substring(0, 600));
+    yandexReachable = false;
+    return;
+  }
+
+  yandexReachable = true;
+  long nowTs = doc["now"].as<long>();
+  if (nowTs == 0) nowTs = (long)timeClient.getEpochTime(); // fallback
+
+  // --- Текущая погода (fact) ---
+  yandexNow.valid = true;
+  yandexNow.fetchedAtTs = nowTs;
+  yandexNow.temperature = fact["temp"].as<float>();
+  yandexNow.feelsLike    = fact.containsKey("feels_like") ? fact["feels_like"].as<float>() : NAN;
+  yandexNow.windSpeed    = fact.containsKey("wind_speed") ? fact["wind_speed"].as<float>() : NAN;
+  yandexNow.condition    = fact.containsKey("condition") ? String(fact["condition"].as<const char*>()) : "";
+  Serial.printf("  Yandex fact: T=%.1f feels=%.1f wind=%.1f cond=%s\n",
+    yandexNow.temperature, yandexNow.feelsLike, yandexNow.windSpeed, yandexNow.condition.c_str());
+
+  // --- Почасовой прогноз: ищем час, ближайший к "сейчас + 2 часа" ---
+  long targetTs = nowTs + 2*3600;
+  long bestDiff = -1;
+  yandexPlus2h.valid = false;
+
+  JsonArray forecasts = doc["forecasts"].as<JsonArray>();
+  int dayIdx = 0;
+  for (JsonObject fday : forecasts) {
+    if (fday.containsKey("hours")) {
+      for (JsonObject h : fday["hours"].as<JsonArray>()) {
+        long hourTs = h["hour_ts"].as<long>();
+        if (hourTs == 0) continue;
+        long diff = abs(hourTs - targetTs);
+        if (bestDiff < 0 || diff < bestDiff) {
+          bestDiff = diff;
+          yandexPlus2h.valid = true;
+          yandexPlus2h.time = hourTs;
+          yandexPlus2h.temperature = h["temp"].as<float>();
+          yandexPlus2h.windSpeed = h.containsKey("wind_speed") ? h["wind_speed"].as<float>() : NAN;
+          yandexPlus2h.condition = h.containsKey("condition") ? String(h["condition"].as<const char*>()) : "";
         }
       }
     }
 
-    int useCount = min(n, NEAREST_COUNT);
-    float weightSum = 0;
-    float valueSum = 0;
-    for (int k = 0; k < useCount; k++) {
-      float d = candidates[i][k].distance;
-      float w = 1.0 / pow(d + IDW_EPS, IDW_POWER);
-      weightSum += w;
-      valueSum += w * candidates[i][k].value;
+    // --- Дневной прогноз (parts.day / parts.night) для первых 2 дней ---
+    if (dayIdx < 2 && fday.containsKey("parts")) {
+      JsonObject parts = fday["parts"];
+      yandexDays[dayIdx].valid = true;
+      yandexDays[dayIdx].tempDay   = parts.containsKey("day")   ? parts["day"]["temp_avg"].as<float>()   : NAN;
+      yandexDays[dayIdx].tempNight = parts.containsKey("night") ? parts["night"]["temp_avg"].as<float>() : NAN;
+    }
+    dayIdx++;
+  }
 
-      if (k < MAX_USED_SENSORS) {
-        results[i].used[k].id       = candidates[i][k].id;
-        results[i].used[k].distance = candidates[i][k].distance;
-        results[i].used[k].time     = candidates[i][k].time;
+  if (yandexPlus2h.valid) {
+    Serial.printf("  Yandex +2h: T=%.1f wind=%.1f cond=%s\n",
+      yandexPlus2h.temperature, yandexPlus2h.windSpeed, yandexPlus2h.condition.c_str());
+  } else {
+    Serial.println("  Yandex +2h: подходящий часовой слот не найден (возможно hours=false сработал не так, или почасовых данных нет на этом тарифе)");
+  }
+  for (int d=0; d<2; d++) {
+    if (yandexDays[d].valid) {
+      Serial.printf("  Yandex day[%d]: day=%.1f night=%.1f\n", d, yandexDays[d].tempDay, yandexDays[d].tempNight);
+    }
+  }
+}
+// ============================================================
+//  computeResults — IDW-усреднение по narodmon (взвешено по расстоянию).
+//  Проверка "сломанного нуля": если в группе 2+ датчика, один показывает
+//  РОВНО 0.0, а другой(ие) отличаются от него больше чем на
+//  ZERO_SENSOR_DIFF_THRESHOLD — нулевой исключается из усреднения.
+// ============================================================
+void computeResults() {
+  long nowTs = (long)timeClient.getEpochTime();
+  anySensorFound = false;
+
+  for (int i = 0; i < S_COUNT; i++) {
+    // Собираем свежие показания этого типа
+    float vals[MAX_ROSTER]; float dists[MAX_ROSTER]; int freshCount = 0;
+
+    for (int k = 0; k < rosterCount[i]; k++) {
+      NmReading& r = nmCache[i][k];
+      r.excludedAsZero = false;
+      if (r.time == 0) continue;
+      long ageMin = (nowTs - r.time) / 60;
+      if (ageMin > FRESH_MINUTES || ageMin < -2) continue;
+      vals[freshCount] = r.value;
+      dists[freshCount] = r.dist;
+      freshCount++;
+    }
+
+    // Проверка "сломанного нуля" — только если есть 2+ свежих показания
+    bool isZero[MAX_ROSTER] = {false};
+    if (freshCount >= 2) {
+      for (int a = 0; a < freshCount; a++) {
+        if (fabsf(vals[a]) > 0.0001f) continue; // не ноль — пропускаем
+        // Этот датчик показывает ровно 0 — сравниваем с остальными
+        for (int b = 0; b < freshCount; b++) {
+          if (a == b || fabsf(vals[b]) <= 0.0001f) continue; // не сравниваем с другим нулём
+          if (fabsf(vals[a] - vals[b]) > ZERO_SENSOR_DIFF_THRESHOLD) {
+            isZero[a] = true; // помечаем как "сломанный", отбросим ниже
+            break;
+          }
+        }
       }
     }
 
+    // IDW-усреднение, пропуская помеченные как "сломанный ноль"
+    float wSum = 0, vSum = 0;
+    int   nmCount = 0;
+    float nearestDist = 1e9f;
+    for (int a = 0; a < freshCount; a++) {
+      if (isZero[a]) continue;
+      float w = 1.0f / powf(dists[a] + IDW_EPS, IDW_POWER);
+      wSum += w; vSum += w * vals[a];
+      nmCount++;
+      if (dists[a] < nearestDist) nearestDist = dists[a];
+    }
+
+    if (nmCount < MIN_SENSORS_NEEDED) {
+      results[i].valid = false;
+      continue;
+    }
+
     results[i].valid = true;
-    results[i].value = valueSum / weightSum;
-    results[i].usedCount = useCount;
-    results[i].nearestDist = candidates[i][0].distance;
-
-    // Сохраняем точку в историю для тренд-индикатора (3ч/1ч/20мин)
+    results[i].value = vSum / wSum;
+    results[i].nmCount = nmCount;
+    results[i].nearestDist = nearestDist;
     historyPush(i, nowTs, results[i].value);
-
-    Serial.printf("%s: %.2f %s (из %d датчиков, ближний %.1f км)\n",
-      sensorTypes[i].displayName, results[i].value, sensorTypes[i].unit,
-      useCount, results[i].nearestDist);
+    if (i == S_WIND_DIR) windDirAddSample(nowTs, results[i].value);
+    anySensorFound = true;
   }
 
-  // Обновить общий флаг: хотя бы один тип дал валидный результат?
-  anySensorFound = false;
+  checkPerParameterAlarms();
+}
+
+// ============================================================
+//  Алерты — теперь ПО КАЖДОМУ ПАРАМЕТРУ отдельно (results[i].inAlarm),
+//  а не общий полноэкранный алерт. anyAlarmActive — общий флаг для LED.
+// ============================================================
+void checkPerParameterAlarms() {
+  anyAlarmActive = false;
+
+  results[S_RADIATION].inAlarm = results[S_RADIATION].valid && results[S_RADIATION].value >= ALARM_RADIATION_MRH;
+  results[S_WIND_SPEED].inAlarm = results[S_WIND_SPEED].valid && results[S_WIND_SPEED].value >= ALARM_WIND_MS;
+  results[S_DUST].inAlarm = results[S_DUST].valid && results[S_DUST].value >= ALARM_DUST_UGM3;
+  results[S_TEMP].inAlarm = results[S_TEMP].valid &&
+    (results[S_TEMP].value <= ALARM_TEMP_COLD_C || results[S_TEMP].value >= ALARM_TEMP_HOT_C);
+  results[S_PRESS].inAlarm = results[S_PRESS].valid &&
+    (results[S_PRESS].value < ALARM_PRESS_LOW_MMHG || results[S_PRESS].value > ALARM_PRESS_HIGH_MMHG);
+  results[S_HUM].inAlarm = results[S_HUM].valid && results[S_HUM].value >= ALARM_HUM_HIGH_PCT;
+
   for (int i = 0; i < S_COUNT; i++) {
-    if (results[i].valid) { anySensorFound = true; break; }
+    if (results[i].inAlarm) anyAlarmActive = true;
   }
 }
-
 // ============================================================
-//  Проверка тревожных условий
-// ============================================================
-void checkAlarms() {
-  String alarms = "";
-  bool any = false;
-
-  if (results[S_RADIATION].valid && results[S_RADIATION].value >= ALARM_RADIATION_USVH) {
-    alarms += "РАДИАЦИЯ ";
-    any = true;
-  }
-  if (results[S_WIND_SPEED].valid && results[S_WIND_SPEED].value >= ALARM_WIND_MS) {
-    alarms += "ШТОРМ ";
-    any = true;
-  }
-  if (results[S_TEMP].valid && results[S_TEMP].value <= ALARM_TEMP_COLD_C) {
-    alarms += "МОРОЗ ";
-    any = true;
-  }
-  if (results[S_TEMP].valid && results[S_TEMP].value >= ALARM_TEMP_HOT_C) {
-    alarms += "ЖАРА ";
-    any = true;
-  }
-  if (results[S_DUST].valid && results[S_DUST].value >= ALARM_DUST_UGM3) {
-    alarms += "ПЫЛЬ ";
-    any = true;
-  }
-
-  alarmActive = any;
-  activeAlarmText = alarms;
-
-  if (any) {
-    Serial.println("ТРЕВОГА: " + alarms);
-  }
-}
-
-// ============================================================
-//  Индикация светодиодом — иерархия приоритетов (от худшего к лучшему):
-//    1. Нет WiFi              -> мигает раз в 1 сек
-//    2. WiFi есть, нет API    -> мигает раз в 3 сек
-//    3. API есть, нет датчиков -> мигает раз в 5 сек
-//    4. Всё хорошо, без тревог -> не горит
-//    5. Погодная тревога активна -> горит непрерывно + пищит раз в 15 мин
-//  Тревога имеет наивысший приоритет и перекрывает статусную индикацию.
+//  LED / Buzzer status — горит непрерывно при любом активном алерте
+//  (anyAlarmActive), иначе обычная иерархия мигания по связи.
 // ============================================================
 void updateStatusLed() {
   bool wifiOk = (WiFi.status() == WL_CONNECTED);
 
-  // Погодная тревога — наивысший приоритет, и это НЕ "проблемное" состояние
-  // связи — таймер защитной перезагрузки сбрасываем.
-  if (alarmActive) {
+  // LED горит, только если ИМЕННО НА ТЕКУЩЕМ ПОКАЗАННОМ экране есть алерт —
+  // не глобально по anyAlarmActive. Пищалка теперь срабатывает отдельно,
+  // в момент отрисовки экрана (см. drawScreenByIndex / beepIfScreenHasAlarm),
+  // а не здесь.
+  bool currentScreenHasAlarm = (carouselIndex != 5) && screenHasVisibleAlarm(carouselIndex);
+
+  if (currentScreenHasAlarm) {
     problemStateSince = 0;
-    digitalWrite(PIN_LED, HIGH); // горит непрерывно
-
-    if (millis() - lastAlarmBeep > (unsigned long)ALARM_BEEP_INTERVAL_SEC * 1000UL) {
-      tone(PIN_BUZZER, 2000, ALARM_BEEP_DURATION_MS);
-      lastAlarmBeep = millis();
-    }
+    digitalWrite(PIN_LED, HIGH);
     return;
   }
 
-  // Без тревоги пищалка всегда молчит
-  noTone(PIN_BUZZER);
-
-  // Статус связи — мигание с разной частотой, приоритет по тяжести проблемы
-  unsigned long blinkPeriodMs;
+  unsigned long blinkMs;
   bool isProblem = true;
-  if (!wifiOk) {
-    blinkPeriodMs = 1000;       // нет WiFi — мигаем раз в секунду
-  } else if (!apiReachable) {
-    blinkPeriodMs = 3000;       // WiFi есть, API не отвечает — раз в 3 сек
-  } else if (!anySensorFound) {
-    blinkPeriodMs = 5000;       // API отвечает, но датчиков нет — раз в 5 сек
-  } else {
-    isProblem = false;
-  }
+  if (!wifiOk)              blinkMs = 1000;
+  else if (!apiReachable)   blinkMs = 3000;
+  else if (!anySensorFound) blinkMs = 5000;
+  else isProblem = false;
 
-  if (!isProblem) {
-    problemStateSince = 0;      // всё хорошо — сбрасываем таймер защитной перезагрузки
-    digitalWrite(PIN_LED, LOW); // и не горит
-    return;
+  if (!isProblem) { problemStateSince = 0; digitalWrite(PIN_LED, LOW); return; }
+  if (!problemStateSince) problemStateSince = millis();
+  else if (millis() - problemStateSince > REBOOT_AFTER_STUCK_SEC * 1000UL) {
+    Serial.println("Stuck 30min — reboot"); delay(500); ESP.restart();
   }
-
-  // Защитная перезагрузка: если "проблемное" мигание держится непрерывно
-  // дольше REBOOT_AFTER_STUCK_SEC — перезагружаемся. Лечит зависания
-  // WiFi-стека/памяти, которые внутренние ретраи не лечат.
-  if (problemStateSince == 0) {
-    problemStateSince = millis();
-  } else if (millis() - problemStateSince > REBOOT_AFTER_STUCK_SEC * 1000UL) {
-    Serial.println("Застряли в проблемном состоянии 30+ минут — перезагрузка");
-    delay(500);
-    ESP.restart();
-  }
-
-  // Мигание: половину периода горит, половину не горит
-  unsigned long halfPeriod = blinkPeriodMs / 2;
-  if (millis() - lastLedBlink > halfPeriod) {
+  if (millis() - lastLedBlink > blinkMs/2) {
     ledBlinkState = !ledBlinkState;
     digitalWrite(PIN_LED, ledBlinkState ? HIGH : LOW);
     lastLedBlink = millis();
@@ -650,390 +1013,771 @@ void updateStatusLed() {
 }
 
 // ============================================================
-//  Верхняя строка: дата, время, температура — на КАЖДОМ экране,
-//  включая служебный. Высота полосы — 22px.
+//  Пищалка по алерту — вызывается ИМЕННО в момент отрисовки экрана
+//  (не каждую итерацию loop()). Один общий таймер lastAlarmBeep на
+//  ВСЕ алерты вместе: если запикали на экране температуры, на экране
+//  радиации не запикаем снова, пока не пройдёт ALARM_BEEP_INTERVAL_SEC
+//  с того момента — независимо от того, какой именно параметр сработал.
 // ============================================================
-const int HEADER_HEIGHT = 22;
+void beepIfScreenHasAlarm(int idx) {
+  if (idx == 5) return; // служебный экран алертов не показывает
+  if (!screenHasVisibleAlarm(idx)) return;
+  if (millis() - lastAlarmBeep < (unsigned long)ALARM_BEEP_INTERVAL_SEC * 1000UL) return;
 
-void drawHeaderBar(uint16_t bgColor) {
-  tft.fillRect(0, 0, 240, HEADER_HEIGHT, bgColor);
-  tft.drawFastHLine(0, HEADER_HEIGHT, 240, TFT_DARKGREY);
+  tone(PIN_BUZZER, 2000, ALARM_BEEP_DURATION_MS);
+  lastAlarmBeep = millis();
+}
+// ============================================================
+//  HEADER BAR (день недели, дата, время, температура — на каждом экране)
+//  Высота и шрифт увеличены в 2 раза по сравнению с первой версией —
+//  места на экране достаточно, а текст так гораздо легче читать.
+// ============================================================
+const int HEADER_H = 44;
 
+void drawHeaderBar(uint16_t bg) {
+  tft.fillRect(0, 0, 240, HEADER_H, bg);
+  tft.drawFastHLine(0, HEADER_H, 240, TFT_DARKGREY);
   long nowTs = (long)timeClient.getEpochTime();
-  int hh = (nowTs % 86400L) / 3600;
-  int mm = (nowTs % 3600L) / 60;
-  int ss = nowTs % 60;
+  long displayTs = nowTs + (long)TZ_DISPLAY_OFFSET_HOURS * 3600L;
+  int hh = (displayTs%86400L)/3600, mm = (displayTs%3600L)/60;
 
-  // Дата считается от epoch (дни с 1970-01-01), переводим в Y-M-D
-  long days = nowTs / 86400L;
-  int y, mo, d;
-  // Алгоритм civil_from_days (Howard Hinnant), без зависимостей
-  long z = days + 719468L;
-  long era = (z >= 0 ? z : z - 146096) / 146097;
-  long doe = z - era * 146097;
-  long yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
-  long yr = yoe + era * 400;
-  long doy = doe - (365*yoe + yoe/4 - yoe/100);
-  long mp = (5*doy + 2)/153;
-  d = doy - (153*mp+2)/5 + 1;
-  mo = mp + (mp < 10 ? 3 : -9);
-  y = yr + (mo <= 2 ? 1 : 0);
+  long days=displayTs/86400L,z=days+719468L;
+  long era=(z>=0?z:z-146096)/146097;
+  long doe=z-era*146097;
+  long yoe=(doe-doe/1460+doe/36524-doe/146096)/365;
+  long yr=yoe+era*400;
+  long doy=doe-(365*yoe+yoe/4-yoe/100);
+  long mp=(5*doy+2)/153;
+  int  dd=doy-(153*mp+2)/5+1;
+  int  mo=mp+(mp<10?3:-9);
+  long y=yr+(mo<=2?1:0);
 
-  char dateBuf[16];
-  snprintf(dateBuf, sizeof(dateBuf), "%02d.%02d.%04d", d, mo, y);
-  char timeBuf[10];
-  snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d:%02d", hh, mm, ss);
+  // День недели: 1 янв 1970 (days=0) был четвергом. Сокращено до 2 символов,
+  // чтобы оставить место для температуры справа без перекрытия.
+  const char* dowNames[7] = {"Su","Mo","Tu","We","Th","Fr","Sa"};
+  int dow = ((days % 7) + 4 + 7) % 7; // +7 защищает от отрицательного остатка
+  const char* dowStr = dowNames[dow];
 
-  tft.setTextSize(1);
-  tft.setTextColor(TFT_WHITE, bgColor);
-  tft.setCursor(4, 7);
-  tft.print(dateBuf);
-  tft.print("  ");
-  tft.print(timeBuf);
+  char buf[40];
+  snprintf(buf,sizeof(buf),"%s %02d.%02d %02d:%02d",dowStr,dd,mo,hh,mm);
 
-  // Температура справа
-  char tBuf[16];
+  tft.setTextSize(2); tft.setTextColor(TFT_GREENYELLOW, bg);
+  tft.setCursor(2,14); tft.print(buf);
+
+  char tbuf[12];
   if (results[S_TEMP].valid) {
-    snprintf(tBuf, sizeof(tBuf), "%.1fC", results[S_TEMP].value);
-  } else {
-    snprintf(tBuf, sizeof(tBuf), "--.-C");
+    float t = results[S_TEMP].value;
+    // Двузначная и более отрицательная температура ("-10" и холоднее) —
+    // округляем до целого без десятых, иначе строка слишком длинная и
+    // налезает на дату/время слева (проверено: "-28.8C" пересекается
+    // с "Mo 23.06 20:32" при текущей раскладке шапки).
+    if (t <= -10.0f) snprintf(tbuf,sizeof(tbuf),"%.0fC",t);
+    else snprintf(tbuf,sizeof(tbuf),"%.1fC",t);
   }
-  int tw = strlen(tBuf) * 6; // примерная ширина при textsize=1
-  tft.setCursor(236 - tw, 7);
-  tft.print(tBuf);
-}
-
-// Высота в уровнях (1..LEVELS) для значения v относительно [vMin,vMax].
-// Если диапазон нулевой (все точки идентичны) — средний уровень.
-int trendLevelOf(float v, float vMin, float vMax, int levels) {
-  if (vMax - vMin < 0.0001f) return (levels + 1) / 2;
-  float frac = (v - vMin) / (vMax - vMin);
-  int lvl = 1 + (int)round(frac * (levels - 1));
-  if (lvl < 1) lvl = 1;
-  if (lvl > levels) lvl = levels;
-  return lvl;
+  else snprintf(tbuf,sizeof(tbuf),"--C");
+  tft.setTextColor(TFT_WHITE, bg);
+  tft.setCursor(240-strlen(tbuf)*12-2, 14); tft.print(tbuf);
 }
 
 // ============================================================
-//  Тренд-индикатор: 4 столбика (3ч, 1ч, 20мин, сейчас) показывающие
-//  ОТНОСИТЕЛЬНЫЙ уровень значения в каждой точке (не направление —
-//  величину), 7 уровней высоты. Текущая точка справа всегда служит
-//  визуальным якорем посередине шкалы.
-//  История хранится в RAM на основе собственных измерений устройства,
-//  без дополнительных запросов sensorsHistory к серверу.
+//  ТРЕНД-БАР — во всю ширину экрана, без подписей. Слоты теперь
+//  фиксированы по времени суток (кратны TREND_SLOT_MINUTES=45 минутам),
+//  а не "скользящее окно от текущего момента" — см. TrendBuffer выше.
+//  32 столбика * 45 минут = 24 часа охвата. Ширина 6px + промежуток 1px:
+//  32*(6+1) = 224px из 240, с запасом по краям.
 // ============================================================
-void drawTrendBars(int idx, int x, int y, uint16_t bgColor) {
-  if (!results[idx].valid) return; // нет текущего значения — индикатор не рисуем
+const int TREND_BAR_W   = 6;
+const int TREND_BAR_GAP = 1;
+const int TREND_BARS_COUNT = TREND_SLOT_COUNT; // 32, видимых столбиков = размер буфера
+const int TREND_LEVELS = 7;
 
-  long nowTs = (long)timeClient.getEpochTime();
-  float v3h, v1h, v20m;
-  bool has3h  = historyFindClosest(idx, nowTs - 3*3600, v3h);
-  bool has1h  = historyFindClosest(idx, nowTs - 1*3600, v1h);
-  bool has20m = historyFindClosest(idx, nowTs - 20*60,  v20m);
-  float vNow = results[idx].value;
+int trendLevel(float v, float vMin, float vMax) {
+  if (vMax-vMin < 0.0001f) return (TREND_LEVELS+1)/2;
+  int lvl = 1 + (int)roundf((v-vMin)/(vMax-vMin)*(TREND_LEVELS-1));
+  return constrain(lvl, 1, TREND_LEVELS);
+}
 
-  // Собираем доступные точки для расчёта диапазона (всегда включаем "сейчас")
-  float vals[4];
-  bool  has[4]  = { has3h, has1h, has20m, true };
-  vals[0] = v3h; vals[1] = v1h; vals[2] = v20m; vals[3] = vNow;
+// Рисует тренд-бар на всю ширину экрана (x=0..240) с базовой линией на y,
+// высотой столбиков вверх до maxBarHeight. idx — индекс параметра в trendBuf[].
+void drawFullWidthTrend(int idx, int baseY, int maxBarHeight, uint16_t bg, bool alarmColor) {
+  if (!results[idx].valid) return;
 
-  float vMin = vNow, vMax = vNow;
-  for (int k = 0; k < 4; k++) {
-    if (!has[k]) continue;
-    if (vals[k] < vMin) vMin = vals[k];
-    if (vals[k] > vMax) vMax = vals[k];
-  }
+  TrendBuffer& buf = trendBuf[idx];
+  float vals[TREND_BARS_COUNT];
+  bool  has[TREND_BARS_COUNT];
+  float vMin = results[idx].value, vMax = results[idx].value;
 
-  const int LEVELS    = 7;     // 7 уровней высоты, как договорились
-  const int BAR_W      = 8;    // ширина одного столбика
-  const int BAR_GAP    = 6;    // промежуток между столбиками
-  const int BAR_MAX_H  = 28;   // высота, соответствующая верхнему уровню
-  const int BAR_BASE_Y = y;    // базовая линия (низ столбиков)
-
-  int levels[4];
-  for (int k = 0; k < 4; k++) {
-    levels[k] = has[k] ? trendLevelOf(vals[k], vMin, vMax, LEVELS) : 0; // 0 = нет данных
-  }
-
-  for (int k = 0; k < 4; k++) {
-    int bx = x + k * (BAR_W + BAR_GAP);
-    if (levels[k] == 0) {
-      // Нет данных для этой точки — рисуем тонкую серую черту-заглушку у базы
-      tft.drawFastHLine(bx, BAR_BASE_Y, BAR_W, TFT_DARKGREY);
-      continue;
+  // k=0 — самый старый видимый слот (слева), k=TREND_BARS_COUNT-1 — самый
+  // новый (справа). Буфер кольцевой, buf.head — индекс самого нового слота,
+  // поэтому слот для позиции k на экране — это (head - (COUNT-1-k)) по кругу.
+  for (int k = 0; k < TREND_BARS_COUNT; k++) {
+    int stepsBack = TREND_BARS_COUNT - 1 - k;
+    int slotPos = (buf.head - stepsBack + TREND_BARS_COUNT) % TREND_BARS_COUNT;
+    has[k] = buf.slots[slotPos].valid;
+    if (has[k]) {
+      vals[k] = buf.slots[slotPos].value;
+      if (vals[k] < vMin) vMin = vals[k];
+      if (vals[k] > vMax) vMax = vals[k];
     }
-    int barH = (BAR_MAX_H * levels[k]) / LEVELS;
-    if (barH < 2) barH = 2;
-    uint16_t color = (k == 3) ? TFT_CYAN : TFT_GREENYELLOW; // текущая точка выделена цветом
-    tft.fillRect(bx, BAR_BASE_Y - barH, BAR_W, barH, color);
+  }
+
+  uint16_t normalColor = TFT_GREENYELLOW;
+  uint16_t lastColor = alarmColor ? TFT_RED : TFT_CYAN;
+
+  for (int k = 0; k < TREND_BARS_COUNT; k++) {
+    int bx = k * (TREND_BAR_W + TREND_BAR_GAP);
+    if (!has[k]) { tft.drawFastHLine(bx, baseY, TREND_BAR_W, TFT_DARKGREY); continue; }
+    int lvl = trendLevel(vals[k], vMin, vMax);
+    int bh = max(2, maxBarHeight * lvl / TREND_LEVELS);
+    uint16_t color = (k == TREND_BARS_COUNT - 1) ? lastColor : normalColor;
+    tft.fillRect(bx, baseY - bh, TREND_BAR_W, bh, color);
   }
 }
 
+// ============================================================
+//  Перевод направления ветра (градусы) в 8-секторную аббревиатуру
+// ============================================================
+const char* windDirStr8(float deg) {
+  const char* dirs[] = {"N","NE","E","SE","S","SW","W","NW"};
+  int sector = ((int)((deg + 22.5f) / 45.0f)) % 8;
+  if (sector < 0) sector += 8;
+  return dirs[sector];
+}
 
-void drawSensorScreen(int idx, bool isAlarmFrame) {
-  uint16_t bgColor = isAlarmFrame ? tft.color565(120, 0, 0) : TFT_BLACK;
-  tft.fillScreen(bgColor);
+// ============================================================
+//  Замена тренд-бара для НАПРАВЛЕНИЯ ВЕТРА: вместо столбиков (которые для
+//  категориальной величины визуально не имеют смысла и "дёргаются") —
+//  3 текстовые метки преобладающего направления слева-направо: 24h, 12h, 6h.
+//  Размер и положение строки — там же, где была бы полоса тренда; цвет —
+//  тот же зелёный, что у обычных столбиков (TFT_GREENYELLOW).
+// ============================================================
+void drawWindDirSummary(int baseY, uint16_t bg) {
+  struct Period { int hours; const char* label; };
+  Period periods[3] = { {24,"24h"}, {12,"12h"}, {6,"6h"} };
 
-  drawHeaderBar(bgColor);
+  tft.setTextSize(2); // крупнее обычного текста подписи, но мельче основной цифры — занимает место тренда
+  int colW = 240 / 3;
 
-  // Заголовок — название параметра
-  tft.setTextColor(TFT_WHITE, bgColor);
-  tft.setTextSize(2);
-  tft.setCursor(10, 32);
-  tft.println(sensorTypes[idx].displayName);
+  for (int k = 0; k < 3; k++) {
+    float deg;
+    bool ok = windDirPrevailing(periods[k].hours, deg);
+    char buf[16];
+    if (ok) snprintf(buf,sizeof(buf),"%s %s",windDirStr8(deg),periods[k].label);
+    else snprintf(buf,sizeof(buf),"-- %s",periods[k].label);
 
-  // Линия-разделитель
-  tft.drawFastHLine(10, 58, 220, TFT_DARKGREY);
+    tft.setTextColor(TFT_GREENYELLOW, bg);
+    int textW = strlen(buf) * 12; // 6px база * textSize2
+    int x = k*colW + (colW-textW)/2; // центрируем в своей колонке
+    if (x < 2) x = 2;
+    tft.setCursor(x, baseY);
+    tft.print(buf);
+  }
+}
 
+// ============================================================
+//  УНИВЕРСАЛЬНЫЙ БЛОК ПАРАМЕТРА: цифра слева (крупно), размерность
+//  справа от цифры (мелко), тренд-бар на всю ширину под ними.
+//  При алерте — цифра алого цвета.
+//  Возвращает Y-координату ПОСЛЕ блока (для размещения следующего).
+// ============================================================
+int drawParamBlock(int idx, int topY, int blockHeight, bool bigNumber, uint16_t bg) {
+  uint16_t numColor = results[idx].inAlarm ? TFT_RED : TFT_WHITE;
+
+  // Максимально увеличенный шрифт, который ещё помещается по высоте в зазор
+  // до тренд-бара (проверено на экстремальных значениях: "-9.5"/"35.0" для
+  // температуры, "100.0"/"800.0"/"999.9" для остальных — см. расчёт в чате):
+  // обычные блоки 4->5, крупный блок (температура) 6->7.
+  int numTextSize = bigNumber ? 7 : 5;
+  int trendH = bigNumber ? 36 : 26; // высота тренд-бара, побольше для крупного блока
+  int numY = topY + 4;
+
+  tft.setTextColor(numColor, bg);
+  tft.setTextSize(numTextSize);
+  tft.setCursor(4, numY);
+
+  char vbuf[16];
   if (!results[idx].valid) {
-    tft.setTextSize(2);
-    tft.setCursor(10, 110);
-    tft.setTextColor(TFT_DARKGREY, bgColor);
-    tft.println("Нет данных");
-    tft.setTextSize(1);
-    tft.setCursor(10, 140);
-    tft.println("Нет свежих публичных");
-    tft.setCursor(10, 155);
-    tft.println("датчиков рядом");
-    return;
-  }
-
-  // Крупное значение
-  tft.setTextColor(TFT_WHITE, bgColor);
-  tft.setTextSize(5);
-  tft.setCursor(10, 85);
-  char buf[16];
-  if (idx == S_WIND_DIR) {
-    // направление — округляем до целого градуса
-    snprintf(buf, sizeof(buf), "%d", (int)round(results[idx].value));
+    tft.setTextColor(TFT_DARKGREY, bg);
+    tft.print("N/D");
   } else {
-    snprintf(buf, sizeof(buf), "%.1f", results[idx].value);
-  }
-  tft.print(buf);
-  tft.setTextSize(2);
-  tft.print(" ");
-  tft.println(sensorTypes[idx].unit);
-
-  // Детали — сколько датчиков, расстояние до ближнего
-  tft.setTextSize(1);
-  tft.setTextColor(TFT_DARKGREY, bgColor);
-  tft.setCursor(10, 175);
-  char detailBuf[64];
-  snprintf(detailBuf, sizeof(detailBuf), "Усреднено по %d датчикам", results[idx].usedCount);
-  tft.println(detailBuf);
-  tft.setCursor(10, 190);
-  snprintf(detailBuf, sizeof(detailBuf), "Ближайший: %.1f км", results[idx].nearestDist);
-  tft.println(detailBuf);
-
-  // Тренд-индикатор: 4 столбика (3ч / 1ч / 20мин / сейчас), не мешает крупной цифре
-  tft.setTextColor(TFT_DARKGREY, bgColor);
-  tft.setCursor(10, 208);
-  tft.print("3ч  1ч  20м  сейчас");
-  drawTrendBars(idx, 10, 248, bgColor);
-
-  // Тревожный баннер
-  if (isAlarmFrame && activeAlarmText.length() > 0) {
-    tft.fillRect(0, 290, 240, 30, TFT_RED);
-    tft.setTextColor(TFT_WHITE, TFT_RED);
-    tft.setTextSize(2);
-    tft.setCursor(5, 297);
-    tft.println(activeAlarmText);
-  }
-
-  // Точки-индикатор карусели снизу (только если не тревога)
-  if (!isAlarmFrame) {
-    int dotsY = 305;
-    int totalDots = S_COUNT + 1; // +1 за служебный экран
-    int startX = 120 - (totalDots * 10) / 2;
-    for (int i = 0; i < totalDots; i++) {
-      uint16_t c = (i == idx) ? TFT_WHITE : TFT_DARKGREY;
-      tft.fillCircle(startX + i * 10, dotsY, 3, c);
+    if (idx == S_WIND_DIR) {
+      // Направление — словами (8 секторов), не числом градусов
+      snprintf(vbuf,sizeof(vbuf),"%s",windDirStr8(results[idx].value));
+    } else {
+      snprintf(vbuf,sizeof(vbuf),"%.1f",results[idx].value);
     }
+    tft.print(vbuf);
   }
+
+  // Размерность — мелким шрифтом справа от цифры, на той же визуальной строке.
+  // Для направления ветра вместо размерности — второе крупное значение
+  // (преобладающее направление за последний час), см. ниже отдельным блоком.
+  int charWidthPx = bigNumber ? 42 : 30; // 6px база * numTextSize (7 и 5 соответственно)
+  int labelX = 4;
+  if (idx != S_WIND_DIR) {
+    int numWidthPx = charWidthPx * strlen(results[idx].valid ? vbuf : "N/D");
+    labelX = min(numWidthPx + 8, 200);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_DARKGREY, bg);
+    tft.setCursor(labelX, numY + (bigNumber ? 8 : 4));
+    tft.print(sensorTypes[idx].unit);
+  } else {
+    int numWidthPx = charWidthPx * strlen(results[idx].valid ? vbuf : "N/D");
+    labelX = min(numWidthPx + 8, 200);
+  }
+
+  // Короткая подпись параметра (Temp/Wet/Press/...) — справа от цифры,
+  // в зазоре между низом цифры и верхом тренда, тем же цветом что "no sensors".
+  // Считаем середину зазора так, чтобы не задеть ни цифру, ни тренд.
+  // Высота глифа = 8px * numTextSize (56px для крупного, 40px для обычного).
+  int numBottomY = numY + 8 * numTextSize;
+  int trendTopY  = topY + blockHeight - 4 - trendH;
+  int labelY = numBottomY + (trendTopY - numBottomY) / 2 - 4; // -4 центрирует текст высотой ~8px
+
+  if (idx == S_WIND_DIR) {
+    // Подпись "Dir" под текущим направлением (как у остальных параметров)
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_DARKGREY, bg);
+    tft.setCursor(4, labelY);
+    tft.print("Dir");
+
+    // Второе крупное значение: преобладающее направление за последний час —
+    // тот же размер шрифта (numTextSize), что и текущее, своя подпись "Dir 1h"
+    float avgDeg;
+    bool haveAvg = windDirPrevailing(1, avgDeg);
+    char avgBuf[8];
+    snprintf(avgBuf,sizeof(avgBuf),"%s", haveAvg ? windDirStr8(avgDeg) : "--");
+
+    int avgX = 130; // правее середины экрана (120px), с запасом от края при максимальной длине "NW"
+    tft.setTextColor(TFT_WHITE, bg);
+    tft.setTextSize(numTextSize);
+    tft.setCursor(avgX, numY);
+    tft.print(avgBuf);
+
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_DARKGREY, bg);
+    tft.setCursor(avgX, labelY);
+    tft.print("Dir 1h");
+  } else {
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_DARKGREY, bg);
+    tft.setCursor(labelX, labelY);
+    tft.print(sensorTypes[idx].shortLabel);
+  }
+
+  int trendBaseY = topY + blockHeight - 4;
+  if (idx == S_WIND_DIR) {
+    // Направление — вместо столбиков тренда показываем преобладающее
+    // направление за 24h/12h/6h текстом (см. drawWindDirSummary)
+    drawWindDirSummary(trendBaseY - 16, bg);
+  } else {
+    drawFullWidthTrend(idx, trendBaseY, trendH, bg, results[idx].inAlarm);
+  }
+
+
+  return topY + blockHeight;
+}
+// ============================================================
+//  ЭКРАН 0: Температура (крупно) + Влажность (обычно)
+// ============================================================
+void drawScreenTempHum() {
+  uint16_t bg = TFT_BLACK;
+  tft.fillScreen(bg);
+  drawHeaderBar(bg);
+
+  int y = HEADER_H + 4;
+  drawParamBlock(S_TEMP, y, 110, true, bg);   // крупный блок ~110px высоты
+
+  // Влажность размещена на той же высоте, где на экранах 1/2 находится
+  // третий блок (давление/осадки) — для единообразной разметки по экранам.
+  int blockH = (320 - HEADER_H - 10) / 3;
+  int humY = HEADER_H + 2 + 2 * blockH;
+  drawParamBlock(S_HUM, humY, blockH, false, bg);
+
+  drawCarouselDots(0);
 }
 
 // ============================================================
-//  Служебный экран: список ID датчиков, которые сейчас
-//  используются в усреднении каждого типа, мелким шрифтом.
-//  Дата/время/температура — в той же шапке, что у всех экранов.
+//  ЭКРАН 1: Ветер / Направление / Давление
 // ============================================================
-void drawServiceScreen() {
-  uint16_t bgColor = TFT_BLACK;
-  tft.fillScreen(bgColor);
-  drawHeaderBar(bgColor);
+void drawScreenWindPress() {
+  uint16_t bg = TFT_BLACK;
+  tft.fillScreen(bg);
+  drawHeaderBar(bg);
 
-  tft.setTextSize(1);
-  tft.setTextColor(TFT_CYAN, bgColor);
-  tft.setCursor(4, 28);
-  tft.println("СЛУЖЕБНЫЙ ЭКРАН: датчики");
+  int y = HEADER_H + 2;
+  int blockH = (320 - HEADER_H - 10) / 3; // делим оставшееся место на 3 равных блока
+  y = drawParamBlock(S_WIND_SPEED, y, blockH, false, bg);
+  y = drawParamBlock(S_WIND_DIR,   y, blockH, false, bg);
+  y = drawParamBlock(S_PRESS,      y, blockH, false, bg);
 
-  int y = 42;
-  const int lineH = 9;
+  drawCarouselDots(1);
+}
 
-  long nowTs = (long)timeClient.getEpochTime();
+// ============================================================
+//  ЭКРАН 2: Качество воздуха (запылённость) / Радиация / Осадки
+// ============================================================
+void drawScreenAirRadPrecip() {
+  uint16_t bg = TFT_BLACK;
+  tft.fillScreen(bg);
+  drawHeaderBar(bg);
 
-  for (int i = 0; i < S_COUNT; i++) {
-    if (y > 295) break; // не вылезаем за пределы экрана
+  int y = HEADER_H + 2;
+  int blockH = (320 - HEADER_H - 10) / 3;
+  y = drawParamBlock(S_DUST,      y, blockH, false, bg);
+  y = drawParamBlock(S_RADIATION, y, blockH, false, bg);
+  y = drawParamBlock(S_PRECIP,    y, blockH, false, bg);
 
-    tft.setTextColor(TFT_WHITE, bgColor);
+  drawCarouselDots(2);
+}
+
+// ============================================================
+//  Точки-индикатор карусели снизу экрана (общие для всех 6 экранов)
+// ============================================================
+void drawCarouselDots(int activeIdx) {
+  int total = TOTAL_SCREENS;
+  int sx = 120 - (total*8)/2;
+  for (int k=0;k<total;k++)
+    tft.fillCircle(sx+k*8, 314, 2, k==activeIdx?TFT_WHITE:TFT_DARKGREY);
+}
+// ============================================================
+//  ЭКРАН 3: Яндекс — данные на момент запроса (верх) + через 2 часа от
+//  того же момента (низ). Подписи — точное время ИМЕННО ЭТИХ данных
+//  (yandexNow.fetchedAtTs), а не текущее время дисплея — это важно,
+//  потому что обновление раз в 2 часа, и к моменту просмотра экрана
+//  "сейчас" уже не совпадает с реальным текущим временем.
+// ============================================================
+void drawScreenYandexNow() {
+  uint16_t bg = TFT_BLACK;
+  tft.fillScreen(bg);
+  drawHeaderBar(bg);
+
+  tft.setTextColor(TFT_CYAN, bg); tft.setTextSize(2);
+  tft.setCursor(4, HEADER_H+8); tft.print("YANDEX WEATHER");
+  tft.drawFastHLine(0, HEADER_H+26, 240, TFT_DARKGREY);
+
+  int y = HEADER_H + 36;
+
+  // --- Блок данных "на момент запроса" ---
+  tft.setTextColor(TFT_DARKGREY, bg); tft.setTextSize(2);
+  tft.setCursor(4, y);
+  if (yandexNow.valid) {
+    long displayTs = yandexNow.fetchedAtTs + (long)TZ_DISPLAY_OFFSET_HOURS*3600L;
+    int hh = (displayTs%86400)/3600, mm = (displayTs%3600)/60;
+    char lbuf[16]; snprintf(lbuf,sizeof(lbuf),"AT %02d:%02d", hh, mm);
+    tft.print(lbuf);
+  } else {
+    tft.print("LATEST");
+  }
+  y += 24;
+
+  if (!yandexReachable || !yandexNow.valid) {
+    tft.setTextColor(TFT_DARKGREY, bg); tft.setTextSize(2);
+    tft.setCursor(8, y+20); tft.print("N/D");
+    y += 90;
+  } else {
+    tft.setTextColor(TFT_WHITE, bg); tft.setTextSize(7);
+    tft.setCursor(8, y);
+    char tbuf[10]; snprintf(tbuf,sizeof(tbuf),"%.0f",yandexNow.temperature);
+    tft.print(tbuf);
+    tft.setTextSize(2); tft.print("C");
+
+    tft.setTextSize(1); tft.setTextColor(TFT_DARKGREY, bg);
+    int rx = 150;
+    int ry = y;
+    if (!isnan(yandexNow.feelsLike)) { tft.setCursor(rx, ry); tft.printf("Feels: %.1fC", yandexNow.feelsLike); ry += 14; }
+    if (!isnan(yandexNow.windSpeed)) { tft.setCursor(rx, ry); tft.printf("Wind: %.1f m/s", yandexNow.windSpeed); ry += 14; }
+
+    y += 80;
+  }
+
+  tft.drawFastHLine(0, y, 240, tft.color565(30,30,30));
+  y += 20;
+
+  // --- Блок "через 2 часа от момента запроса" ---
+  tft.setTextColor(TFT_DARKGREY, bg); tft.setTextSize(2);
+  tft.setCursor(4, y);
+  if (yandexPlus2h.valid) {
+    long displayTs = yandexPlus2h.time + (long)TZ_DISPLAY_OFFSET_HOURS*3600L;
+    int hh = (displayTs%86400)/3600, mm = (displayTs%3600)/60;
+    char lbuf[16]; snprintf(lbuf,sizeof(lbuf),"AT %02d:%02d", hh, mm);
+    tft.print(lbuf);
+  } else {
+    tft.print("+2H");
+  }
+  y += 24;
+
+  if (!yandexReachable || !yandexPlus2h.valid) {
+    tft.setTextColor(TFT_DARKGREY, bg); tft.setTextSize(2);
+    tft.setCursor(8, y+20); tft.print("N/D");
+  } else {
+    tft.setTextColor(TFT_WHITE, bg); tft.setTextSize(7);
+    tft.setCursor(8, y);
+    char tbuf[10]; snprintf(tbuf,sizeof(tbuf),"%.0f",yandexPlus2h.temperature);
+    tft.print(tbuf);
+    tft.setTextSize(2); tft.print("C");
+
+    tft.setTextSize(1); tft.setTextColor(TFT_DARKGREY, bg);
+    int rx = 150;
+    if (!isnan(yandexPlus2h.windSpeed)) { tft.setCursor(rx, y); tft.printf("Wind: %.1f m/s", yandexPlus2h.windSpeed); }
+  }
+
+  drawCarouselDots(3);
+}
+
+// ============================================================
+//  ЭКРАН 4: Яндекс — прогноз на 2 дня (today + tomorrow).
+//  Бесплатный тариф отдаёт только эти 2 дня (forecasts[0]=today,
+//  forecasts[1]=tomorrow) — подписываем явно словами, без претензии
+//  на "послезавтра", которого на этом тарифе физически нет.
+// ============================================================
+// ============================================================
+void drawScreenYandexForecast() {
+  uint16_t bg = TFT_BLACK;
+  tft.fillScreen(bg);
+  drawHeaderBar(bg);
+
+  tft.setTextColor(TFT_CYAN, bg); tft.setTextSize(2);
+  tft.setCursor(4, HEADER_H+8); tft.print("YANDEX FORECAST");
+  tft.drawFastHLine(0, HEADER_H+26, 240, TFT_DARKGREY);
+
+  int y = HEADER_H + 36;
+
+  // Бесплатный тариф отдаёт только 2 дня — сегодня и завтра (forecasts[0]/[1]),
+  // подписываем явно словами, без претензии на "послезавтра"
+  const char* dayLabels[2] = {"TODAY", "TOMORROW"};
+
+  for (int d = 0; d < 2; d++) {
+    tft.setTextColor(TFT_DARKGREY, bg); tft.setTextSize(2);
     tft.setCursor(4, y);
-    tft.print(sensorTypes[i].displayName);
-    tft.print(":");
-    y += lineH;
+    tft.print(dayLabels[d]);
+    y += 24;
 
-    if (!results[i].valid) {
-      tft.setTextColor(TFT_DARKGREY, bgColor);
-      tft.setCursor(8, y);
-      tft.print("нет данных");
-      y += lineH;
+    if (!yandexReachable || !yandexDays[d].valid) {
+      tft.setTextColor(TFT_DARKGREY, bg); tft.setTextSize(2);
+      tft.setCursor(8, y+20); tft.print("N/D");
+      y += 100;
       continue;
     }
 
-    for (int k = 0; k < results[i].usedCount && k < MAX_USED_SENSORS; k++) {
-      if (y > 295) break;
-      long ageMin = (nowTs - results[i].used[k].time) / 60;
-      tft.setTextColor(TFT_GREENYELLOW, bgColor);
-      tft.setCursor(8, y);
-      char buf[48];
-      snprintf(buf, sizeof(buf), "S%ld  %.1fкм  %ldмин назад",
-        results[i].used[k].id, results[i].used[k].distance, ageMin);
-      tft.print(buf);
-      y += lineH;
+    tft.setTextColor(TFT_WHITE, bg); tft.setTextSize(5);
+    int dayX = 8;
+    tft.setCursor(dayX, y);
+    char dbuf[10]; snprintf(dbuf,sizeof(dbuf),"%.0f",yandexDays[d].tempDay);
+    tft.print(dbuf);
+    tft.setTextSize(1); tft.print("C");
+
+    // Подпись "day" точно под цифрой (тот же X, что начало числа), под низом глифа
+    tft.setTextColor(TFT_DARKGREY, bg);
+    tft.setCursor(dayX, y + 8*5 + 2); // 8*textSize = высота глифа цифры, +2 небольшой зазор
+    tft.print("day");
+
+    if (!isnan(yandexDays[d].tempNight)) {
+      // Фиксированная позиция правее середины экрана (120px), с запасом от
+      // края при экстремальных значениях (двузначный минус "-15" и т.п.) —
+      // не зависит от длины дневной температуры, чтобы не "скакать" по X.
+      int nightX = 130;
+      tft.setTextSize(5); tft.setTextColor(TFT_WHITE, bg);
+      tft.setCursor(nightX, y);
+      char nbuf[10]; snprintf(nbuf,sizeof(nbuf),"%.0f",yandexDays[d].tempNight);
+      tft.print(nbuf);
+      tft.setTextSize(1); tft.print("C");
+      tft.setTextColor(TFT_DARKGREY, bg);
+      tft.setCursor(nightX, y + 8*5 + 2); // под цифрой ночной температуры, тот же принцип
+      tft.print("nt");
     }
-    y += 2; // небольшой отступ между группами
+
+    y += 56;
+    y += 20;
+    tft.drawFastHLine(0, y, 240, tft.color565(30,30,30));
+    y += 10;
   }
+
+  drawCarouselDots(4);
 }
 
 // ============================================================
-//  Карусель: решает какой экран показывать сейчас
-//  Индексы 0..7 — обычные параметры, индекс 8 — служебный экран
+//  ЭКРАН 5: Служебный экран — список ID/расстояний/возраста датчиков narodmon
 // ============================================================
-const int TOTAL_SCREENS = S_COUNT + 1; // +1 служебный
+void drawScreenService() {
+  uint16_t bg = TFT_BLACK;
+  tft.fillScreen(bg);
+  drawHeaderBar(bg);
+  tft.setTextColor(TFT_CYAN,bg); tft.setTextSize(1);
+  tft.setCursor(4,HEADER_H+8); tft.print("DIAGNOSTICS");
+  tft.drawFastHLine(0,HEADER_H+20,240,TFT_DARKGREY);
+
+  long nowTs = (long)timeClient.getEpochTime();
+  int y = HEADER_H + 28;
+  for (int i=0; i<S_COUNT; i++) {
+    if (y>300) break;
+    tft.setTextColor(TFT_WHITE,bg);
+    tft.setCursor(4,y); tft.print(sensorTypes[i].displayName); tft.print(":");
+    tft.setCursor(130,y); tft.printf("r=%dkm t=%d/%d", searchRadiusByType[i], trendBuf[i].filledCount, TREND_SLOT_COUNT);
+    y+=10;
+    for (int k=0; k<rosterCount[i]; k++) {
+      if (y>300) break;
+      NmReading& r = nmCache[i][k];
+      long ageMin = r.time>0 ? (nowTs-r.time)/60 : -1;
+      char buf[56];
+      if (r.time==0) snprintf(buf,sizeof(buf)," S%ld  %.1fkm  waiting",
+        sensorRoster[i][k].id, sensorRoster[i][k].distance);
+      else snprintf(buf,sizeof(buf)," S%ld  %.1fkm  %ldm%s",
+        sensorRoster[i][k].id, sensorRoster[i][k].distance, ageMin,
+        r.excludedAsZero ? " [0!]" : "");
+      tft.setTextColor(r.excludedAsZero ? TFT_RED : (r.time>0?TFT_GREENYELLOW:TFT_DARKGREY), bg);
+      tft.setCursor(4,y); tft.print(buf);
+      y+=10;
+    }
+    if (rosterCount[i]==0) { tft.setTextColor(TFT_DARKGREY,bg); tft.setCursor(4,y); tft.print(" no sensors"); y+=10; }
+    y+=2;
+  }
+
+  drawCarouselDots(5);
+}
+// ============================================================
+//  Проверка "есть ли смысл показывать этот экран карусели".
+//  Экран 0 (темп/влажность) — всегда показывается, температура
+//  является якорем карусели даже с N/D.
+// ============================================================
+bool carouselScreenHasData(int idx) {
+  if (idx == 0) return true; // якорь карусели
+
+  if (idx == 1) return results[S_WIND_SPEED].valid || results[S_WIND_DIR].valid || results[S_PRESS].valid;
+  if (idx == 2) return results[S_DUST].valid || results[S_RADIATION].valid || results[S_PRECIP].valid;
+  if (idx == 3) return yandexNow.valid || yandexPlus2h.valid;
+  if (idx == 4) return yandexDays[0].valid || yandexDays[1].valid;
+
+  // idx == 5, служебный экран — показываем только если есть хоть один датчик
+  for (int i=0; i<S_COUNT; i++) if (rosterCount[i] > 0) return true;
+  return false;
+}
+
+// Есть ли алерт хоть по одному параметру, видимому НА ЭТОМ конкретном экране?
+// (используется для удвоения времени показа — не общий anyAlarmActive,
+// а именно то, что показано на текущем экране)
+bool screenHasVisibleAlarm(int idx) {
+  if (idx == 0) return results[S_TEMP].inAlarm || results[S_HUM].inAlarm;
+  if (idx == 1) return results[S_WIND_SPEED].inAlarm || results[S_PRESS].inAlarm;
+  if (idx == 2) return results[S_DUST].inAlarm || results[S_RADIATION].inAlarm;
+  return false; // экраны Яндекса и служебный — алертов не показывают
+}
+
+// Общая функция отрисовки экрана по индексу — используется и обычной
+// каруселью, и принудительным переключением кнопкой TTP223.
+void drawScreenByIndex(int idx) {
+  switch (idx) {
+    case 0: drawScreenTempHum(); break;
+    case 1: drawScreenWindPress(); break;
+    case 2: drawScreenAirRadPrecip(); break;
+    case 3: drawScreenYandexNow(); break;
+    case 4: drawScreenYandexForecast(); break;
+    case 5: drawScreenService(); break;
+  }
+  beepIfScreenHasAlarm(idx); // писк только в момент показа экрана с алертом, не постоянно
+}
+
+// ============================================================
+//  TTP223 сенсорная кнопка — принудительное управление каруселью.
+//  Логика: первое касание -> экран 0, активируется 30-секундное окно.
+//  Повторное касание в этом окне -> следующий экран, окно сбрасывается
+//  на новые 30 секунд. Без новых касаний 30 секунд -> override снимается,
+//  обычная автокарусель продолжает с ТЕКУЩЕГО экрана (не сбрасывается).
+// ============================================================
+void handleTouchButton() {
+  bool pinState = (digitalRead(PIN_TOUCH_BUTTON) == HIGH);
+
+  // Простой debounce по времени: реагируем на изменение состояния
+  // только если оно устойчиво держится TOUCH_DEBOUNCE_MS
+  if (pinState != lastTouchPinState) {
+    lastTouchChangeMs = millis();
+    lastTouchPinState = pinState;
+    return; // ждём следующего вызова для подтверждения
+  }
+
+  static bool touchHandledThisPress = false;
+  bool stable = (millis() - lastTouchChangeMs) > TOUCH_DEBOUNCE_MS;
+
+  if (pinState && stable && !touchHandledThisPress) {
+    // Зафиксировано новое нажатие (фронт, подтверждённый debounce)
+    touchHandledThisPress = true;
+
+    if (!touchOverrideActive) {
+      // Первое нажатие — принудительно показываем экран 0
+      touchOverrideActive = true;
+      carouselIndex = 0;
+    } else {
+      // Уже в режиме override — двигаемся на следующий экран
+      do {
+        carouselIndex = (carouselIndex + 1) % TOTAL_SCREENS;
+      } while (!carouselScreenHasData(carouselIndex));
+    }
+
+    drawScreenByIndex(carouselIndex);
+    lastCarouselSwitch = millis();
+    touchOverrideUntil = millis() + TOUCH_OVERRIDE_TIMEOUT_MS;
+  }
+
+  if (!pinState) {
+    touchHandledThisPress = false; // кнопка отпущена — готовы к следующему нажатию
+  }
+
+  // Истекло 30-секундное окно — снимаем override, дальше обычная карусель
+  // продолжает с ТЕКУЩЕГО экрана (carouselIndex не трогаем)
+  if (touchOverrideActive && millis() > touchOverrideUntil) {
+    touchOverrideActive = false;
+    lastCarouselSwitch = millis(); // даём текущему экрану его обычное время показа с нуля
+  }
+}
 
 void updateCarousel() {
-  if (millis() - lastCarouselSwitch < (unsigned long)CAROUSEL_INTERVAL_SEC * 1000UL) {
-    return; // ещё не время менять экран
+  if (touchOverrideActive) return; // карусель не трогает экран, пока активен override от кнопки
+
+  int delayS;
+  if (carouselIndex == 5) {
+    delayS = DELAY_SERVICE_SEC; // служебный экран — всегда короче, алертов не показывает
+  } else {
+    delayS = screenHasVisibleAlarm(carouselIndex) ? DELAY_ALARM_SEC : DELAY_NORMAL_SEC;
   }
+  if (millis()-lastCarouselSwitch < (unsigned long)delayS*1000UL) return;
   lastCarouselSwitch = millis();
 
-  // Если тревога активна — через раз показываем тревожный экран
-  static bool showAlarmNext = false;
-  if (alarmActive) {
-    showAlarmNext = !showAlarmNext;
-    if (showAlarmNext) {
-      drawSensorScreen(S_TEMP, true); // тревожный кадр — крупно температура + баннер
-      return;
-    }
-  }
+  drawScreenByIndex(carouselIndex);
 
-  // Обычная карусель: temp всегда первый (carouselIndex==0),
-  // потом остальные параметры, последним — служебный экран
-  if (carouselIndex == S_COUNT) {
-    drawServiceScreen();
-  } else {
-    drawSensorScreen(carouselIndex, false);
-  }
-
-  carouselIndex++;
-  if (carouselIndex >= TOTAL_SCREENS) carouselIndex = 0;
+  do {
+    carouselIndex = (carouselIndex+1) % TOTAL_SCREENS;
+  } while (!carouselScreenHasData(carouselIndex));
 }
-
 // ============================================================
-//  Setup / Loop
+//  SETUP / LOOP
 // ============================================================
 void setup() {
-  Serial.begin(115200);
-  delay(300);
-  Serial.println("\n=== Погодный дисплей ESP32 + ST7789 ===");
+  Serial.begin(115200); delay(300);
+  Serial.println("\n=== Weather Display v3.0 (narodmon + Яндекс.Погода) ===");
 
-  pinMode(PIN_LED, OUTPUT);
-  digitalWrite(PIN_LED, LOW);
+  for (int i = 0; i < S_COUNT; i++) searchRadiusByType[i] = BASE_SEARCH_RADIUS;
+
+  pinMode(PIN_LED, OUTPUT); digitalWrite(PIN_LED, LOW);
   pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_TOUCH_BUTTON, INPUT); // TTP223 имеет собственный выходной драйвер, внешняя подтяжка не нужна
+
+  // Один писк + одно мигание светодиодом при загрузке — проверка подключения
+  digitalWrite(PIN_LED, HIGH);
+  tone(PIN_BUZZER, 2000, 200);
+  delay(250);
+  digitalWrite(PIN_LED, LOW);
+  noTone(PIN_BUZZER);
 
   tft.init();
-  tft.setRotation(0); // 240x320 портретная ориентация; 2 = landscape если нужно
+  tft.setRotation(0);
   tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextSize(2);
-  tft.setCursor(10, 10);
-  tft.println("Загрузка...");
+  tft.setTextColor(TFT_WHITE,TFT_BLACK);
+  tft.setTextSize(1);
+  tft.setCursor(4,4); tft.println("Starting...");
 
   nmUUID = md5String(String(NM_UUID_SRC));
-
-  // Защита: служебный экран хранит детали только по MAX_USED_SENSORS датчикам
-  if (NEAREST_COUNT > MAX_USED_SENSORS) {
-    Serial.printf("NEAREST_COUNT=%d больше MAX_USED_SENSORS=%d, ограничиваю\n", NEAREST_COUNT, MAX_USED_SENSORS);
-    NEAREST_COUNT = MAX_USED_SENSORS;
-  }
+  if (NEAREST_COUNT > MAX_ROSTER) NEAREST_COUNT = MAX_ROSTER;
 
   connectWiFi();
+  tft.setCursor(4,14); tft.print("WiFi... ");
+  tft.println(WiFi.status()==WL_CONNECTED?"OK":"FAIL");
 
-  tft.setCursor(10, 40);
-  if (WiFi.status() == WL_CONNECTED) {
-    tft.println("WiFi OK");
-  } else {
-    tft.setTextColor(TFT_RED, TFT_BLACK);
-    tft.println("WiFi не подключён, продолжаем...");
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  timeClient.begin(); timeClient.forceUpdate();
+
+  tft.setCursor(4,24); tft.println("Sensor types...");
+  if (WiFi.status()==WL_CONNECTED) typeCodesLoaded = loadSensorTypeCodes();
+  tft.setCursor(4,34); tft.println(typeCodesLoaded?"Types: OK":"Types: FAIL");
+
+  // Яндекс.Погода — НЕ запрашиваем сразу при старте, первый запрос только
+  // через YANDEX_STARTUP_DELAY_MS (5 минут) после включения, см. loop().
+  tft.setCursor(4,44); tft.println("Yandex Weather: waiting 5 min...");
+  bootMillis = millis();
+
+  if (typeCodesLoaded && WiFi.status()==WL_CONNECTED) {
+    tft.setCursor(4,54); tft.println("Searching sensors...");
+    refreshSensorRoster(false);
+    lastNearbyHour = ((long)timeClient.getEpochTime()/3600)%24;
+    lastNearbyHour = (lastNearbyHour/6)*6;
   }
 
-  timeClient.begin();
-  timeClient.forceUpdate();
+  computeResults();
+  lastRequestMinute = ((long)timeClient.getEpochTime()/60)%1440;
 
-  tft.setCursor(10, 70);
-  tft.println("Справочник типов...");
-  bool typesOk = false;
-  if (WiFi.status() == WL_CONNECTED) {
-    typesOk = loadSensorTypeCodes();
-  }
-  if (!typesOk) {
-    tft.setCursor(10, 100);
-    tft.setTextColor(TFT_RED, TFT_BLACK);
-    tft.println("Справочник не получен, попробуем в фоне");
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    delay(1500);
-  }
-  typeCodesLoaded = typesOk;
-
-  tft.setCursor(10, 130);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  if (typeCodesLoaded) {
-    tft.println("Первые данные...");
-    fetchAndAverage();
-    checkAlarms();
-  } else {
-    tft.println("Ждём подключения...");
-  }
-  lastRequestMinute = ((long)timeClient.getEpochTime() / 60) % 1440;
-
-  drawSensorScreen(S_TEMP, false);
+  drawScreenTempHum();
   lastCarouselSwitch = millis();
 }
 
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
-    connectWiFi();
-  }
-
+  if (WiFi.status() != WL_CONNECTED) connectWiFi();
   timeClient.update();
 
-  // Если справочник типов ещё не загружен (например WiFi не было при старте) —
-  // пробуем подгрузить его при первой возможности, не дожидаясь расписания
-  if (!typeCodesLoaded && WiFi.status() == WL_CONNECTED) {
+  if (!typeCodesLoaded && WiFi.status()==WL_CONNECTED)
     typeCodesLoaded = loadSensorTypeCodes();
+
+  bool rosterJustRefreshed = false;
+
+  // Обычный полный обзор раз в 6 часов (все 8 типов, попытка сузить радиус)
+  if (typeCodesLoaded && isNearbyRefreshDue() && WiFi.status()==WL_CONNECTED) {
+    refreshSensorRoster(false);
+    rosterJustRefreshed = true;
   }
 
-  // Обновление данных с сервера по расписанию (минута от начала суток UTC)
-  if (typeCodesLoaded && isScheduledMinuteNow()) {
-    fetchAndAverage();
-    checkAlarms();
+  // Быстрый цикл расширения радиуса (каждые 2 минуты, до 2 датчиков на тип)
+  if (typeCodesLoaded && WiFi.status()==WL_CONNECTED &&
+      millis()-lastFastExpandCheck > FAST_EXPAND_INTERVAL_MS) {
+    if (anyTypeNeedsExpansion()) {
+      Serial.println("Fast expand: some types still short on sensors, retrying sooner");
+      refreshSensorRoster(true);
+      rosterJustRefreshed = true;
+    }
+    lastFastExpandCheck = millis();
   }
 
-  // Карусель экранов
+  // Запрос показаний по самым старым датчикам
+  bool anyKnownSensor = false;
+  for (int i=0; i<S_COUNT; i++) if (rosterCount[i] > 0) { anyKnownSensor = true; break; }
+
+  if (!rosterJustRefreshed && typeCodesLoaded && anyKnownSensor &&
+      isScheduledMinuteNow() && WiFi.status()==WL_CONNECTED) {
+    fetchOldestSensors();
+    computeResults();
+  }
+
+  // Яндекс.Погода: первый запрос — через 5 минут после старта. Далее —
+  // адаптивно: за 30 минут до истечения актуальности текущего слота
+  // "+2 часа" (nextYandexFetchTs считается внутри после каждого успешного
+  // запроса). При неудаче — повтор через YANDEX_RETRY_AFTER_FAIL_MIN.
+  if (WiFi.status()==WL_CONNECTED) {
+    bool shouldFetchNow = false;
+
+    if (!firstYandexFetchDone) {
+      shouldFetchNow = (millis() - bootMillis >= YANDEX_STARTUP_DELAY_MS);
+    } else {
+      long nowTs = (long)timeClient.getEpochTime();
+      shouldFetchNow = (nextYandexFetchTs > 0 && nowTs >= nextYandexFetchTs);
+    }
+
+    if (shouldFetchNow) {
+      fetchYandexWeather();
+      firstYandexFetchDone = true;
+
+      long nowTs = (long)timeClient.getEpochTime();
+      if (yandexReachable && yandexPlus2h.valid) {
+        // Следующий запрос — за 30 минут до истечения актуальности этого слота
+        nextYandexFetchTs = yandexPlus2h.time - (long)YANDEX_PRE_EXPIRY_MIN * 60;
+        // Защита: если по какой-то причине это время уже в прошлом
+        // (например, слот оказался слишком близко к "сейчас") — не зависаем
+        // в цикле непрерывных запросов, даём хотя бы небольшую паузу.
+        if (nextYandexFetchTs <= nowTs) nextYandexFetchTs = nowTs + (long)YANDEX_RETRY_AFTER_FAIL_MIN * 60;
+      } else {
+        // Неудача — пробуем снова через 30 минут, не ждём расчётного времени
+        nextYandexFetchTs = nowTs + (long)YANDEX_RETRY_AFTER_FAIL_MIN * 60;
+      }
+    }
+  }
+
+  handleTouchButton();
   updateCarousel();
-
-  // Индикация светодиодом: статус связи (мигание) или тревога (горит + пищалка)
   updateStatusLed();
-
-  delay(200); // частота проверки расписания — раз в ~200мс достаточно
+  delay(200);
 }

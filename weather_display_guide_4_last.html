@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Погодный дисплей v4 — ESP32 + ST7789 (narodmon + Яндекс.Погода + web)</title>
+<style>
+  :root {
+    --bg:#0f1117;--bg2:#181c27;--bg3:#1e2333;--border:#2a3048;
+    --accent:#4f8ef7;--green:#34c98e;--amber:#f5a623;--purple:#b07aff;
+    --teal:#3ecfcf;--red:#e05c5c;--text:#e4e8f0;--text2:#8b93a8;
+    --text3:#5a6278;--code-bg:#10141e;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--text);font-family:-apple-system,'Segoe UI',sans-serif;font-size:15px;line-height:1.7}
+  header{background:var(--bg2);border-bottom:1px solid var(--border);padding:32px 24px 28px;position:sticky;top:0;z-index:100}
+  .hi{max-width:920px;margin:0 auto}
+  header h1{font-size:22px;font-weight:600;letter-spacing:-.3px}
+  header p{color:var(--text2);font-size:13px;margin-top:4px}
+  .badge{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:4px;margin:8px 6px 0 0}
+  .bb{background:#1a2a4a;color:var(--accent);border:1px solid #253a6a}
+  .bg{background:#0f2a1e;color:var(--green);border:1px solid #1a4030}
+  .br{background:#2a1010;color:var(--red);border:1px solid #4a1a1a}
+  .ba{background:#2a1e0a;color:var(--amber);border:1px solid #4a3010}
+  .bp{background:#160a25;color:var(--purple);border:1px solid #301060}
+  .wrap{max-width:920px;margin:0 auto;padding:0 24px 80px}
+  nav{background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:20px 24px;margin:32px 0 40px}
+  nav h2{font-size:11px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:1px;margin-bottom:12px}
+  nav ol{list-style:none;counter-reset:c;display:grid;grid-template-columns:1fr 1fr;gap:4px 24px}
+  nav li{counter-increment:c}
+  nav a{color:var(--text2);text-decoration:none;font-size:13px;display:flex;align-items:center;gap:8px;padding:4px 0}
+  nav a::before{content:counter(c,decimal-leading-zero);font-size:11px;font-weight:600;color:var(--text3);min-width:20px}
+  nav a:hover{color:var(--accent)}
+  section{margin-bottom:56px}
+  .sh{display:flex;align-items:center;gap:16px;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--border)}
+  .sn{width:36px;height:36px;border-radius:50%;background:var(--accent);color:#fff;font-weight:700;font-size:15px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+  .sn.g{background:var(--green)}.sn.a{background:var(--amber);color:#1a1000}
+  .sn.p{background:var(--purple)}.sn.t{background:var(--teal);color:#001a1a}.sn.r{background:var(--red)}
+  .sh h2{font-size:20px;font-weight:600}
+  .sh p{font-size:13px;color:var(--text2);margin-top:2px}
+  .card{background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:20px 24px;margin-bottom:16px}
+  .card h3{font-size:14px;font-weight:600;margin-bottom:12px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{text-align:left;padding:8px 12px;color:var(--text3);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.7px;border-bottom:1px solid var(--border)}
+  td{padding:9px 12px;border-bottom:1px solid var(--border);color:var(--text2);vertical-align:top}
+  tr:last-child td{border-bottom:none}
+  td:first-child{color:var(--text);font-weight:500}
+  .mono{font-family:monospace;font-size:12px;color:var(--accent)}
+  .code-block{background:var(--code-bg);border:1px solid var(--border);border-radius:8px;margin:16px 0;overflow:hidden}
+  .ch{background:var(--bg3);padding:8px 14px;font-size:11px;font-weight:600;color:var(--text3);display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border)}
+  .code-block pre{padding:16px 18px;overflow-x:auto;font-family:'SF Mono','Fira Code','Courier New',monospace;font-size:12.5px;line-height:1.65;color:#c9d1e0;white-space:pre}
+  .cb{background:var(--border);border:none;border-radius:4px;color:var(--text2);padding:3px 10px;font-size:11px;cursor:pointer;transition:background .15s}
+  .cb:hover{background:#3a4060;color:var(--text)}
+  .kw{color:#c792ea}.fn{color:#82aaff}.str{color:#c3e88d}.cm{color:#546e7a;font-style:italic}.nm{color:#f78c6c}.df{color:var(--amber)}
+  .alert{border-radius:8px;padding:14px 18px;font-size:13.5px;margin:16px 0;border-left:3px solid;display:flex;gap:12px;align-items:flex-start}
+  .ai{font-size:16px;flex-shrink:0;margin-top:1px}
+  .warn{background:#1e1500;border-color:var(--amber);color:#c8a070}
+  .info{background:#0a1425;border-color:var(--accent);color:#7aabf7}
+  .ok{background:#0a1e14;border-color:var(--green);color:#60c898}
+  .tip{background:#160a25;border-color:var(--purple);color:#a07aee}
+  ul.steps{list-style:none}
+  ul.steps li{display:flex;gap:16px;padding:14px 0;border-bottom:1px solid var(--border)}
+  ul.steps li:last-child{border-bottom:none}
+  .si{width:24px;height:24px;border-radius:50%;background:var(--bg3);border:1px solid var(--border);color:var(--text3);font-size:12px;font-weight:600;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:2px}
+  ul.steps strong{color:var(--text);display:block;margin-bottom:4px}
+  ul.steps p{color:var(--text2);font-size:13.5px}
+  .wdiag{background:var(--bg2);border:1px solid var(--border);border-radius:10px;overflow-x:auto;padding:24px;margin-bottom:16px}
+  .wt{min-width:640px;width:100%;font-size:13px;border-collapse:collapse}
+  .wt th{background:var(--bg3);padding:10px 14px;text-align:center;font-size:11px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.7px;border-bottom:1px solid var(--border)}
+  .wt td{padding:10px 14px;border-bottom:1px solid var(--border);text-align:center;vertical-align:middle}
+  .wt tr:last-child td{border-bottom:none}
+  .pb{display:inline-block;padding:2px 10px;border-radius:4px;font-family:monospace;font-size:12px;font-weight:600}
+  .pv{background:#2a0f0f;color:var(--red);border:1px solid #4a1a1a}
+  .pg{background:#1e1e1e;color:#888;border:1px solid #333}
+  .pe{background:#1a2a4a;color:var(--accent);border:1px solid #253a6a}
+  .pr{background:#1e0a2a;color:var(--purple);border:1px solid #3a1060}
+  .pn{background:#0a2a14;color:var(--green);border:1px solid #1a5030}
+  .pa{background:#2a1e0a;color:var(--amber);border:1px solid #4a3010}
+  .set-table td:first-child{font-family:monospace;color:var(--teal);width:42%}
+  footer{background:var(--bg2);border-top:1px solid var(--border);padding:24px;text-align:center;color:var(--text3);font-size:12px}
+  @media(max-width:600px){nav ol{grid-template-columns:1fr}.sh h2{font-size:17px}}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="hi">
+    <h1>Погодный дисплей v4 — ESP32 + ST7789</h1>
+    <p>narodmon.ru (приоритет "самые старые показания") + Яндекс.Погода · 6 экранов · тач-кнопка · алерты</p>
+    <span class="badge bb">ESP32 + ST7789 240×320</span>
+    <span class="badge bg">narodmon — адаптивный радиус</span>
+    <span class="badge ba">Яндекс.Погода REST v2</span>
+    <span class="badge bp">TTP223 сенсорная кнопка</span>
+    <span class="badge br">Алерты по 7 параметрам</span>
+    <span class="badge bg">Веб-интерфейс + WiFi fallback</span>
+  </div>
+</header>
+
+<div class="wrap">
+
+<nav>
+  <h2>Содержание</h2>
+  <ol>
+    <li><a href="#s1">Архитектура и ключевые решения</a></li>
+    <li><a href="#s2">Экраны устройства</a></li>
+    <li><a href="#s3">Что купить и схема подключения</a></li>
+    <li><a href="#s4">Arduino IDE и библиотеки</a></li>
+    <li><a href="#s5">narodmon — логика сбора данных</a></li>
+    <li><a href="#s6">Яндекс.Погода — получение ключа и логика</a></li>
+    <li><a href="#s7">Настройка прошивки (все переменные)</a></li>
+    <li><a href="#s8">Алерты, LED, пищалка</a></li>
+    <li><a href="#s9">Тач-кнопка TTP223</a></li>
+    <li><a href="#s10">Диагностика по Serial Monitor</a></li>
+    <li><a href="#s11">Остальные настраиваемые параметры</a></li>
+    <li><a href="#s12">Веб-интерфейс: настройки, датчики, логи, WiFi fallback</a></li>
+  </ol>
+</nav>
+
+<section id="s1">
+  <div class="sh"><div class="sn">1</div><div><h2>Архитектура и ключевые решения</h2></div></div>
+  <div class="card">
+    <ul class="steps">
+      <li><div class="si">1</div><div><strong>Два источника данных</strong><p>narodmon.ru (соседские датчики) для текущих показаний и Яндекс.Погода для прогноза — без сторонних метео-API.</p></div></li>
+      <li><div class="si">2</div><div><strong>Адаптивный радиус поиска narodmon</strong><p>Старт с 10 км, расширение по 15 км, пока не наберётся 2 датчика на тип (максимум 100 км). На экране значение показывается уже при 1 датчике.</p></div></li>
+      <li><div class="si">3</div><div><strong>Выбор датчиков "по самым старым показаниям"</strong><p>Вместо простой ротации по кругу — каждую минуту запрашиваются 3 датчика с самыми старыми известными данными (с защитой "не чаще раза в 5 минут на 1 датчик").</p></div></li>
+      <li><div class="si">4</div><div><strong>6 экранов, сгруппированных по смыслу</strong><p>Темп+Влажность, Ветер+Направление+Давление, Качество воздуха+Радиация+Осадки, Яндекс сейчас/+2ч, Яндекс прогноз на 2 дня, служебный.</p></div></li>
+      <li><div class="si">5</div><div><strong>Алерты — точечные, не на весь экран</strong><p>При срабатывании конкретного параметра красной становится только его цифра, а не весь фон экрана. LED горит только когда показан экран с алертом, пищалка пикает один раз при показе такого экрана (не чаще заданного интервала).</p></div></li>
+      <li><div class="si">6</div><div><strong>Направление ветра — без бессмысленного тренда</strong><p>Векторная сумма направлений (не обычное среднее — иначе 350° и 10° усреднились бы в "юг"). Текущее направление + среднее за час рядом, и три текстовые метки 24ч/12ч/6ч вместо столбиков.</p></div></li>
+      <li><div class="si">7</div><div><strong>Сенсорная кнопка TTP223</strong><p>Принудительное переключение экранов на 30 секунд, потом автокарусель продолжает с того места.</p></div></li>
+      <li><div class="si">8</div><div><strong>Кириллица не используется на экране</strong><p>Встроенный шрифт TFT_eSPI не поддерживает кириллицу — весь текст на дисплее на английском.</p></div></li>
+      <li><div class="si">9</div><div><strong>Все настройки — через веб-интерфейс</strong><p>Ничего не нужно перепрошивать: WiFi, ключи, координаты, пороги алертов и остальное редактируются на странице <span class="mono">/settings</span>. Если WiFi не задан или недоступен при включении — устройство само поднимает точку доступа для первоначальной настройки (раздел 12).</p></div></li>
+    </ul>
+  </div>
+</section>
+
+<section id="s2">
+  <div class="sh"><div class="sn g">2</div><div><h2>Экраны устройства</h2><p>Карусель из 6 экранов, листается автоматически или кнопкой</p></div></div>
+  <div class="card">
+    <table>
+      <tr><th>№</th><th>Экран</th><th>Содержимое</th><th>Время показа</th></tr>
+      <tr><td>0</td><td>Temp / Humidity</td><td>Температура крупно + тренд, влажность + тренд</td><td>8с (12с с алертом)</td></tr>
+      <tr><td>1</td><td>Wind / Dir / Pressure</td><td>Скорость ветра, направление (словами + среднее за час + 24ч/12ч/6ч), давление</td><td>8с (12с с алертом)</td></tr>
+      <tr><td>2</td><td>Air Quality / Radiation / Precip</td><td>PM2.5, радиация (mR/h), осадки</td><td>8с (12с с алертом)</td></tr>
+      <tr><td>3</td><td>Yandex Weather</td><td>Погода на момент запроса + прогноз через 2 часа от этого момента</td><td>8с</td></tr>
+      <tr><td>4</td><td>Yandex Forecast</td><td>Прогноз Today/Tomorrow (день/ночь) — это максимум, что даёт бесплатный тариф</td><td>8с</td></tr>
+      <tr><td>5</td><td>Diagnostics</td><td>IP-адрес веб-интерфейса, список ID датчиков narodmon, расстояние, возраст данных, текущий радиус поиска</td><td>4с</td></tr>
+    </table>
+  </div>
+  <div class="alert info">
+    <span class="ai">💡</span>
+    <span>Пустые экраны (например, если данных от Яндекса ещё нет в первые 5 минут после включения) автоматически пропускаются каруселью — кроме экрана 0, который всегда показывается (хотя бы с N/D), он служит "якорем".</span>
+  </div>
+</section>
+
+<section id="s3">
+  <div class="sh"><div class="sn a">3</div><div><h2>Что купить и схема подключения</h2></div></div>
+  <div class="card">
+    <table>
+      <tr><th>Компонент</th><th>Поиск на Ali</th><th>Примечание</th></tr>
+      <tr><td>ESP32 DevKit (WROOM-32)</td><td>ESP32-WROOM-32 DevKit</td><td>Любая плата на 30 пинов</td></tr>
+      <tr><td>Дисплей ST7789 240×320 SPI</td><td>ST7789 2.0 inch SPI 240x320</td><td>Без тач-сенсора, он не нужен</td></tr>
+      <tr><td>Светодиод 5мм + резистор 220 Ом</td><td>—</td><td>Любой яркий цвет</td></tr>
+      <tr><td>Пьезопищалка активная 5V</td><td>active buzzer module 5V</td><td>3-пиновый модуль, третий пин (детектор) не используется</td></tr>
+      <tr><td>Сенсорная кнопка TTP223</td><td>TTP223 touch sensor module</td><td>Цифровой выход, HIGH при касании</td></tr>
+    </table>
+  </div>
+  <div class="wdiag">
+    <table class="wt">
+      <tr><th>Сигнал</th><th>ESP32 пин</th><th>Примечание</th></tr>
+      <tr><td>Дисплей: MOSI</td><td><span class="pb pe">GPIO23</span></td><td rowspan="6">Настраивается в библиотеке TFT_eSPI (User_Setup.h), не в .ino-файле</td></tr>
+      <tr><td>Дисплей: SCLK</td><td><span class="pb pe">GPIO18</span></td></tr>
+      <tr><td>Дисплей: CS</td><td><span class="pb pa">GPIO15</span></td></tr>
+      <tr><td>Дисплей: DC</td><td><span class="pb pr">GPIO2</span></td></tr>
+      <tr><td>Дисплей: RST</td><td><span class="pb pr">GPIO4</span></td></tr>
+      <tr><td>Дисплей: BLK</td><td>3.3V (постоянно)</td></tr>
+      <tr><td>LED (через резистор 220 Ом)</td><td><span class="pb pn">GPIO26</span></td><td>Статус связи / алерт</td></tr>
+      <tr><td>Buzzer (+)</td><td><span class="pb pn">GPIO25</span></td><td>Сигнал алерта</td></tr>
+      <tr><td>TTP223 OUT</td><td><span class="pb pv">GPIO27</span></td><td>HIGH при касании, без внешней подтяжки</td></tr>
+    </table>
+  </div>
+</section>
+
+<section id="s4">
+  <div class="sh"><div class="sn t">4</div><div><h2>Arduino IDE и библиотеки</h2></div></div>
+  <div class="card">
+    <h3>Пакет плат ESP32 — пошагово</h3>
+    <ul class="steps">
+      <li><div class="si">1</div><div><strong>Файл → Настройки (Preferences)</strong><p>В поле "Additional Boards Manager URLs" вставьте адрес ниже (несколько адресов через запятую, если там уже что-то есть).</p></div></li>
+      <li><div class="si">2</div><div><strong>Инструменты → Плата → Boards Manager</strong><p>В поиске введите <span class="mono">esp32</span>, найдите пакет <strong>esp32 by Espressif Systems</strong> и нажмите Install.</p></div></li>
+      <li><div class="si">3</div><div><strong>Инструменты → Плата → ESP32 Arduino → выберите <span class="mono">ESP32 Dev Module</span></strong><p>Это универсальный вариант для любой платы на чипе WROOM-32 (в т.ч. "ESP32 DevKit", "ESP32 DevKit V1" и похожие безымянные платы с Ali/China — они почти всегда заводятся именно под этим пунктом меню).</p></div></li>
+      <li><div class="si">4</div><div><strong>Инструменты → Порт → выберите нужный COM-порт</strong><p>Плата должна быть подключена по USB; порт появляется в списке только когда она подключена.</p></div></li>
+    </ul>
+    <div class="code-block">
+      <div class="ch"><span>Additional Boards Manager URL</span><button class="cb" onclick="copyCode(this)">копировать</button></div>
+      <pre>https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json</pre>
+    </div>
+  </div>
+  <div class="alert warn">
+    <span class="ai">⚠</span>
+    <span>Если в списке плат выбрано что-то из другого семейства (например, плата на чипе <span class="mono">nRF52840</span>, <span class="mono">STM32</span> или обычная <span class="mono">Arduino Uno/Nano</span>) — компиляция не пойдёт в принципе, даже если поставить все библиотеки правильно: у этого проекта требование именно на WiFi-радиомодуль ESP32, которого физически нет в других чипах. Убедитесь, что в Инструменты → Плата выбрано именно <span class="mono">ESP32 Arduino → ESP32 Dev Module</span>.</span>
+  </div>
+  <div class="card">
+    <h3>Библиотеки (Library Manager)</h3>
+    <table>
+      <tr><th>Библиотека</th><th>Автор</th></tr>
+      <tr><td>TFT_eSPI</td><td>Bodmer</td></tr>
+      <tr><td>ArduinoJson (v6)</td><td>Benoit Blanchon</td></tr>
+      <tr><td>NTPClient</td><td>Fabrice Weinberg</td></tr>
+    </table>
+    <p style="color:var(--text2);font-size:13px;margin-top:12px"><code>WiFi.h</code>, <code>WiFiClientSecure.h</code>, <code>WiFiUDP.h</code>, <code>HTTPClient.h</code>, <code>MD5Builder.h</code>, <code>Preferences.h</code>, <code>WebServer.h</code>, <code>DNSServer.h</code> идут в комплекте с пакетом плат ESP32 — отдельно ставить не нужно.</p>
+  </div>
+  <div class="alert info">
+    <span class="ai">💡</span>
+    <span>Если IDE пишет "Несколько библиотек найдено для WiFi.h" и в качестве используемой указывает путь <span class="mono">...\Arduino\libraries\WiFi</span> (а не путь внутри пакета esp32) — значит, в вашей личной папке библиотек случайно лежит сторонняя библиотека с именем ровно "WiFi" (осталась от другого проекта), которая перебивает собой правильную. Найдите и удалите/переименуйте такую папку в <span class="mono">Документы\Arduino\libraries</span> — тогда IDE возьмёт WiFi-библиотеку из пакета esp32 автоматически.</span>
+  </div>
+  <div class="alert warn">
+    <span class="ai">⚠</span>
+    <span>В TFT_eSPI обязательно настройте <span class="mono">User_Setup.h</span> под пины из раздела 3 (модель ST7789, 240×320). Если экран остаётся чёрным — почти всегда дело в этом файле, не в самом .ino.</span>
+  </div>
+  <div class="alert info">
+    <span class="ai">💡</span>
+    <span>Если после прошивки Serial Monitor показывает пустоту, хотя устройство явно работает (экран обновляется) — известная особенность Arduino IDE 1.8.10: помогает полностью закрыть и снова открыть приложение (не только окно монитора).</span>
+  </div>
+</section>
+
+<section id="s5">
+  <div class="sh"><div class="sn">5</div><div><h2>narodmon — логика сбора данных</h2></div></div>
+  <div class="card">
+    <h3>Адаптивный радиус поиска</h3>
+    <ul class="steps">
+      <li><div class="si">1</div><div><strong>Старт — 10 км на каждый из 8 типов параметров</strong><p>Раз в 6 часов — плановая ревизия всех типов; раз в 2 минуты — быстрое расширение только "голодных" (где меньше 2 датчиков).</p></div></li>
+      <li><div class="si">2</div><div><strong>Шаг расширения +15 км, потолок 100 км</strong><p>Останавливается, как только наберётся 2 датчика на тип — этого достаточно для базовой надёжности, расширять дальше нет смысла.</p></div></li>
+      <li><div class="si">3</div><div><strong>На экране значение появляется уже при 1 датчике</strong><p>N/D показывается только если вообще нет ни одного датчика данного типа в радиусе до 100 км.</p></div></li>
+      <li><div class="si">4</div><div><strong>Раз в 6 часов — попытка сузить радиус обратно</strong><p>Если у типа набралось 4+ датчика — радиус возвращается к базовым 10 км (запас на случай, если 1-2 датчика отключатся).</p></div></li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3>Выбор датчиков для опроса — "самые старые показания"</h3>
+    <p style="color:var(--text2);margin-bottom:12px">Каждую минуту запрашиваются 3 датчика (лимит narodmon — 3 на запрос) — но не по кругу, а те, у которых самые старые известные данные. Датчики, которые ещё не дали ни одного показания, считаются "максимально старыми" и получают приоритет.</p>
+    <p style="color:var(--text2)">Защита: один и тот же датчик не запрашивается чаще раза в 5 минут, даже если формально остаётся "самым старым" — это даёт серверу время реально обновить значение.</p>
+  </div>
+  <div class="card">
+    <h3>Проверка на "сломанный ноль"</h3>
+    <p style="color:var(--text2)">Если в группе 2+ свежих датчика, и один показывает ровно 0.0, а другой(ие) отличаются больше чем на 1.0 — нулевой исключается из усреднения (вероятна неисправность датчика, не реальный физический ноль). На служебном экране такой датчик помечается <span class="mono">[0!]</span> красным.</p>
+  </div>
+</section>
+
+<section id="s6">
+  <div class="sh"><div class="sn g">6</div><div><h2>Яндекс.Погода — ключ и логика</h2></div></div>
+  <div class="card">
+    <h3>Получение ключа (бесплатный тариф "для умного дома")</h3>
+    <ul class="steps">
+      <li><div class="si">1</div><div><strong>yandex.ru → Кабинет разработчика → API Погодных Данных</strong><p>Выбрать бесплатный тариф (умного дома) — лимит 30 запросов в сутки навсегда, прогноз на 2 дня.</p></div></li>
+      <li><div class="si">2</div><div><strong>Скопировать ключ</strong><p>Вставить в <span class="mono">YANDEX_WEATHER_KEY</span> в коде.</p></div></li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3>Адаптивное расписание запросов</h3>
+    <p style="color:var(--text2);margin-bottom:12px">Вместо фиксированного интервала — каждый следующий запрос планируется ровно за 30 минут до того, как истекает актуальность текущего прогноза "+2 часа". Например: запрос в 1:18 → слот на 3:00 → следующий запрос в 2:30 → слот на 4:00 → следующий в 3:30...</p>
+    <p style="color:var(--text2)">Получается шаг ~1.5 часа (≈16 запросов/сутки) — с большим запасом от лимита 30/сутки. При неудачном запросе повтор — через 30 минут, не дожидаясь расчётного времени.</p>
+  </div>
+  <div class="alert warn">
+    <span class="ai">⚠</span>
+    <span>Прогноз на 2 дня от Яндекса — это <strong>сегодня и завтра</strong> (так документирован параметр <span class="mono">limit</span> в их API), не "завтра и послезавтра". На экране подписано явно как Today/Tomorrow, без обмана.</span>
+  </div>
+</section>
+
+<section id="s7">
+  <div class="sh"><div class="sn a">7</div><div><h2>Настройка прошивки</h2></div></div>
+  <div class="alert ok">
+    <span class="ai">✓</span>
+    <span>Начиная с этой версии всё перечисленное ниже (и ещё десяток служебных параметров) можно менять и без переподключения к компьютеру — через веб-интерфейс, раздел 12. Значения из кода ниже используются только как дефолты при самой первой прошивке, пока в устройстве ещё ничего не сохранено.</span>
+  </div>
+  <div class="card">
+    <h3>Обязательно заполнить</h3>
+    <table class="set-table">
+      <tr><th>Параметр</th><th>Что поставить</th></tr>
+      <tr><td>WIFI_SSID / WIFI_PASS</td><td>Ваши данные WiFi (2.4 ГГц)</td></tr>
+      <tr><td>NM_API_KEY</td><td>narodmon.ru → Профиль → Мои приложения</td></tr>
+      <tr><td>YANDEX_WEATHER_KEY</td><td>Из раздела 6</td></tr>
+      <tr><td>MY_LAT / MY_LON</td><td>Координаты точки наблюдения</td></tr>
+      <tr><td>TZ_DISPLAY_OFFSET_HOURS</td><td>3 для Москвы — влияет только на отображаемые часы, не на расчёты</td></tr>
+    </table>
+  </div>
+  <div class="card">
+    <h3>Можно настроить дополнительно</h3>
+    <table class="set-table">
+      <tr><th>Параметр</th><th>Значение по умолчанию</th><th>Смысл</th></tr>
+      <tr><td>BASE_SEARCH_RADIUS</td><td>10 км</td><td>Старт поиска датчиков narodmon</td></tr>
+      <tr><td>MAX_SEARCH_RADIUS</td><td>100 км</td><td>Потолок расширения</td></tr>
+      <tr><td>RADIUS_STEP_KM</td><td>15 км</td><td>Шаг расширения за один "хоп"</td></tr>
+      <tr><td>MIN_SENSORS_TO_STOP_EXPAND</td><td>2</td><td>Сколько датчиков достаточно, чтобы прекратить расширение</td></tr>
+      <tr><td>MIN_SENSORS_NEEDED</td><td>1</td><td>Минимум для показа значения (не N/D)</td></tr>
+      <tr><td>NEAREST_COUNT</td><td>3</td><td>Максимум датчиков на тип</td></tr>
+      <tr><td>FRESH_MINUTES</td><td>60</td><td>Порог "протухания" показания (увеличено — некоторые соседские датчики, особенно ветер/направление/осадки, сами обновляются редко)</td></tr>
+      <tr><td>MIN_REQUERY_INTERVAL_MIN</td><td>5</td><td>Не переспрашивать один датчик чаще, чем раз в столько минут</td></tr>
+      <tr><td>ZERO_SENSOR_DIFF_THRESHOLD</td><td>1.0</td><td>Порог для проверки "сломанный ноль"</td></tr>
+      <tr><td>DELAY_NORMAL_SEC / DELAY_ALARM_SEC / DELAY_SERVICE_SEC</td><td>8 / 12 / 4</td><td>Время показа экранов</td></tr>
+    </table>
+  </div>
+  <div class="alert info">
+    <span class="ai">💡</span>
+    <span>Узнать координаты: Google Maps → правый клик на точке → координаты в формате "55.751244, 37.618423" первым пунктом меню.</span>
+  </div>
+</section>
+
+<section id="s8">
+  <div class="sh"><div class="sn r">8</div><div><h2>Алерты, LED, пищалка</h2></div></div>
+  <div class="card">
+    <h3>Пороги срабатывания</h3>
+    <table>
+      <tr><th>Параметр</th><th>Порог</th></tr>
+      <tr><td>Радиация</td><td>≥ 30 mR/h</td></tr>
+      <tr><td>Скорость ветра</td><td>≥ 20 м/с</td></tr>
+      <tr><td>Температура</td><td>≤ -30°C или ≥ 35°C</td></tr>
+      <tr><td>Качество воздуха (PM2.5)</td><td>≥ 150 мкг/м³</td></tr>
+      <tr><td>Давление</td><td>&lt; 660 или &gt; 800 мм рт.ст.</td></tr>
+      <tr><td>Влажность</td><td>≥ 99%</td></tr>
+    </table>
+    <p style="color:var(--text2);font-size:13px;margin-top:12px">Направление ветра и осадки — без алертов (не предусмотрены пороги).</p>
+  </div>
+  <div class="card">
+    <h3>Поведение при срабатывании</h3>
+    <ul class="steps">
+      <li><div class="si">1</div><div><strong>Только цифра конкретного параметра становится красной</strong><p>Остальной экран и остальные параметры — обычным цветом.</p></div></li>
+      <li><div class="si">2</div><div><strong>LED горит непрерывно, только когда показан экран с алертом — с безусловным приоритетом</strong><p>Это жёсткое правило: даже если в этот момент устройство пытается переподключиться к WiFi (свои 15 секунд попытки) — индикация связи не имеет права перебить ровное горение LED при активном алерте. На остальных экранах (включая Яндекс и служебный) LED работает в обычном режиме диагностики связи.</p></div></li>
+      <li><div class="si">3</div><div><strong>Пищалка пикает один раз в момент показа экрана с алертом</strong><p>Один общий таймер на все алерты сразу — повторный писк (даже от другого параметра) не раньше 15 минут после предыдущего.</p></div></li>
+      <li><div class="si">4</div><div><strong>Время показа экрана с активным алертом увеличено до 12 секунд</strong><p>Вместо обычных 8 — чтобы успеть заметить.</p></div></li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3>LED — статус связи (когда нет алерта)</h3>
+    <table>
+      <tr><th>Состояние</th><th>Индикация</th></tr>
+      <tr><td>Нет WiFi</td><td>Мигает раз в 1 сек</td></tr>
+      <tr><td>WiFi есть, API не отвечает</td><td>Мигает раз в 3 сек</td></tr>
+      <tr><td>API отвечает, нет датчиков</td><td>Мигает раз в 5 сек</td></tr>
+      <tr><td>Всё хорошо</td><td>Не горит</td></tr>
+    </table>
+    <p style="color:var(--text2);font-size:13px;margin-top:12px">Мигание начинается не мгновенно: состояние проверяется раз в 10 секунд, и индикатор реагирует только после 3 проверок подряд с проблемой — то есть проблема должна продержаться минимум ~30 секунд. Кратковременные сбои связи (доли секунды — пара секунд) больше не дёргают светодиод.</p>
+  </div>
+  <div class="alert ok">
+    <span class="ai">✓</span>
+    <span>Один писк + одно мигание LED сразу при включении — это просто проверка подключения, не алерт.</span>
+  </div>
+</section>
+
+<section id="s9">
+  <div class="sh"><div class="sn p">9</div><div><h2>Тач-кнопка TTP223</h2></div></div>
+  <div class="card">
+    <ul class="steps">
+      <li><div class="si">1</div><div><strong>Первое касание</strong><p>Принудительно показывает экран 0, активирует 30-секундное окно ручного управления.</p></div></li>
+      <li><div class="si">2</div><div><strong>Повторное касание в течение этих 30 секунд</strong><p>Переключает на следующий экран (пустые пропускаются), таймер сбрасывается на новые 30 секунд.</p></div></li>
+      <li><div class="si">3</div><div><strong>30 секунд без новых касаний</strong><p>Окно закрывается, обычная автокарусель продолжает с того экрана, где остановилась кнопка — не с начала.</p></div></li>
+    </ul>
+  </div>
+</section>
+
+<section id="s10">
+  <div class="sh"><div class="sn g">10</div><div><h2>Диагностика по Serial Monitor</h2></div></div>
+  <div class="card">
+    <h3>Типичные строки лога</h3>
+    <div class="code-block">
+      <div class="ch"><span>Пример нормальной работы</span></div>
+      <pre>sensorsNearby: FULL-REVIEW mode, radius 10 km, types=[1,2,3,4,5,12,22,9]
+  TEMP: 3 sensors, radius stays 10 km
+  cached TEMP[0] = 21.40 (age 3m)
+  [trend] Temp: new slot opened, 5/32 filled
+Fast expand: some types still short on sensors, retrying sooner
+sensorsNearby: FAST-EXPAND mode, radius 25 km, types=[2,4,5,12,22,9]
+Fetching Yandex Weather...
+  Yandex fact: T=19.0 feels=16.0 wind=2.2 cond=clear</pre>
+    </div>
+  </div>
+  <div class="alert warn">
+    <span class="ai">⚠</span>
+    <span>Если видите <span class="mono">HTTP -1</span> для Яндекс-запросов — проверьте интернет-соединение и правильность ключа. Если <span class="mono">no 'fact' in response</span> — структура ответа от Яндекса отличается от ожидаемой (может зависеть от тарифа или со временем измениться на их стороне); сырой JSON-ответ выводится в этой же строке лога — по нему можно скорректировать парсинг в коде.</span>
+  </div>
+  <div class="alert info">
+    <span class="ai">💡</span>
+    <span>Serial Monitor на 115200 бод. Если после прошивки экран пуст — закройте и снова откройте Arduino IDE целиком (известная особенность версии 1.8.10).</span>
+  </div>
+</section>
+
+<section id="s11">
+  <div class="sh"><div class="sn t">11</div><div><h2>Остальные настраиваемые параметры</h2><p>Всё, что не попало в разделы 7-8 — разбито по смыслу, трогать необязательно</p></div></div>
+  <div class="card">
+    <h3>Расписание запросов к Яндексу</h3>
+    <table class="set-table">
+      <tr><th>Параметр</th><th>По умолчанию</th><th>Смысл</th></tr>
+      <tr><td>YANDEX_STARTUP_DELAY_MS</td><td>5 минут</td><td>Задержка первого запроса после включения</td></tr>
+      <tr><td>YANDEX_PRE_EXPIRY_MIN</td><td>30 минут</td><td>За сколько до истечения текущего прогноза запрашивать следующий (см. раздел 6)</td></tr>
+      <tr><td>YANDEX_RETRY_AFTER_FAIL_MIN</td><td>30 минут</td><td>Повтор после неудачного запроса</td></tr>
+    </table>
+  </div>
+  <div class="card">
+    <h3>Тренд-бары</h3>
+    <table class="set-table">
+      <tr><th>Параметр</th><th>По умолчанию</th><th>Смысл</th></tr>
+      <tr><td>TREND_SLOT_MINUTES</td><td>45 минут</td><td>Длительность одного столбика тренда</td></tr>
+      <tr><td>TREND_SLOT_COUNT</td><td>32</td><td>Сколько столбиков показывается (32×45мин = 24 часа охвата)</td></tr>
+      <tr><td>WIND_DIR_HOURS</td><td>24 часа</td><td>Глубина истории для расчёта преобладающего направления ветра</td></tr>
+    </table>
+    <p style="color:var(--text2);font-size:13px;margin-top:12px">Тренд-слоты привязаны к фиксированным отметкам времени (00:00, 00:45, 01:30...), а не к моменту включения устройства — это даёт предсказуемое заполнение независимо от того, когда был последний перезапуск.</p>
+  </div>
+  <div class="card">
+    <h3>Тач-кнопка</h3>
+    <table class="set-table">
+      <tr><th>Параметр</th><th>По умолчанию</th><th>Смысл</th></tr>
+      <tr><td>TOUCH_OVERRIDE_TIMEOUT_MS</td><td>30 секунд</td><td>Окно ручного управления после касания (см. раздел 9)</td></tr>
+    </table>
+  </div>
+  <div class="card">
+    <h3>Пищалка и watchdog</h3>
+    <table class="set-table">
+      <tr><th>Параметр</th><th>По умолчанию</th><th>Смысл</th></tr>
+      <tr><td>ALARM_BEEP_INTERVAL_SEC</td><td>15 минут</td><td>Минимальный интервал между писками при алертах (см. раздел 8)</td></tr>
+      <tr><td>ALARM_BEEP_DURATION_MS</td><td>300 мс</td><td>Длительность одного писка</td></tr>
+      <tr><td>REBOOT_AFTER_STUCK_SEC</td><td>30 минут</td><td>Если связь не восстанавливается так долго (нет WiFi/API/датчиков) — устройство перезагружается само</td></tr>
+    </table>
+  </div>
+  <div class="card">
+    <h3>Узкоспециальные (трогать не нужно почти никогда)</h3>
+    <table class="set-table">
+      <tr><th>Параметр</th><th>По умолчанию</th><th>Смысл</th></tr>
+      <tr><td>IDW_POWER / IDW_EPS</td><td>1.0 / 0.1</td><td>Параметры формулы взвешивания по расстоянию (IDW) при усреднении нескольких датчиков</td></tr>
+      <tr><td>REQUEST_PERIOD_MIN / REQUEST_OFFSET_MIN</td><td>1 / 0</td><td>Нужны только если запускаете несколько таких устройств с одного IP — позволяют развести их запросы по разным минутам, не нарушая лимит narodmon "1 запрос/минуту на клиента"</td></tr>
+      <tr><td>FAST_EXPAND_INTERVAL_MS</td><td>2 минуты</td><td>Как часто проверяется необходимость быстрого расширения радиуса (см. раздел 5)</td></tr>
+    </table>
+  </div>
+</section>
+
+<section id="s12">
+  <div class="sh"><div class="sn p">12</div><div><h2>Веб-интерфейс: настройки, датчики, логи, WiFi fallback</h2><p>Три вкладки на самом устройстве — ничего не нужно перепрошивать</p></div></div>
+
+  <div class="card">
+    <h3>Как попасть в веб-интерфейс</h3>
+    <ul class="steps">
+      <li><div class="si">1</div><div><strong>Устройство уже в вашей WiFi-сети</strong><p>IP-адрес показан на служебном экране карусели (экран 5) и в Serial Monitor строкой <span class="mono">WiFi OK &lt;ip&gt;</span> при старте. Откройте <span class="mono">http://&lt;ip&gt;/</span> в браузере — сразу попадёте на страницу настроек.</p></div></li>
+      <li><div class="si">2</div><div><strong>Устройство ещё ни разу не подключалось к WiFi</strong><p>Через <span class="mono">WIFI_CONNECT_TIMEOUT_MIN</span> минут (по умолчанию 10) после включения устройство само поднимает точку доступа — см. ниже.</p></div></li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>Вкладка "Настройки" — /settings</h3>
+    <p style="color:var(--text2);margin-bottom:12px">Форма со всеми параметрами прошивки, сгруппированными по смыслу: WiFi, точка доступа и пароль веб-интерфейса, narodmon, Яндекс.Погода, координаты и часовой пояс, поиск датчиков, свежесть и усреднение, тайминги экранов, пороги алертов, LED/зуммер/кнопка, watchdog.</p>
+    <p style="color:var(--text2)">Сохранение (кнопка внизу формы) пишет значения в NVS-память ESP32 (переживает переподключение питания и переперепрошивку кода) и перезагружает устройство, чтобы все зависящие от настроек структуры — ростер датчиков, радиусы поиска и т.д. — переинициализировались с нуля, без риска рассинхрона.</p>
+  </div>
+
+  <div class="alert warn">
+    <span class="ai">⚠</span>
+    <span>На странице настроек WiFi-пароль и API-ключи видны открытым текстом (иначе их нельзя было бы ни проверить, ни изменить). Если в сети есть недоверенные пользователи — задайте пароль веб-интерфейса (поле <span class="mono">WEB_ADMIN_PASSWORD</span> в той же форме). Логин всегда <span class="mono">admin</span>, пустое поле = вход без пароля.</span>
+  </div>
+
+  <div class="card">
+    <h3>Точка доступа при первой настройке (WiFi fallback)</h3>
+    <ul class="steps">
+      <li><div class="si">1</div><div><strong>Только для самого первого подключения после включения</strong><p>Если за <span class="mono">WIFI_CONNECT_TIMEOUT_MIN</span> минут устройство ни разу не подключилось — поднимает свою точку доступа (<span class="mono">AP_SSID</span> / <span class="mono">AP_PASSWORD</span>, по умолчанию <span class="mono">WeatherDisplay-Setup</span> / <span class="mono">12345678</span>) и показывает на экране её имя, пароль и адрес <span class="mono">192.168.4.1</span>.</p></div></li>
+      <li><div class="si">2</div><div><strong>Подключитесь к этой сети телефоном или ноутбуком</strong><p>Откройте <span class="mono">192.168.4.1</span> в браузере (на многих телефонах откроется само — устройство отвечает на стандартные адреса проверки интернета Android/iOS/Windows).</p></div></li>
+      <li><div class="si">3</div><div><strong>Впишите домашний WiFi и остальные параметры, сохраните</strong><p>Устройство перезагрузится и попробует подключиться снова.</p></div></li>
+      <li><div class="si">4</div><div><strong>Обрывы связи ПОСЛЕ первого успешного подключения — это уже не AP fallback</strong><p>Устройство просто бесконечно переподключается в фоне (как и раньше, до этой версии), не поднимая точку доступа повторно и не прерывая показ карусели. Повторный сценарий "точка доступа для настройки" возможен только после физической перезагрузки устройства, если оно снова ни разу не подключится за отведённое время.</p></div></li>
+    </ul>
+  </div>
+
+  <div class="alert info">
+    <span class="ai">💡</span>
+    <span>Пока активна точка доступа — устройство одновременно продолжает пробовать домашнюю сеть в фоне (режим WiFi AP+STA), раз в 30 секунд. Если роутер просто был выключен и снова заработал — устройство само тихо выйдет из режима настройки, без участия пользователя.</span>
+  </div>
+
+  <div class="card">
+    <h3>Вкладка "Датчики" — /sensors</h3>
+    <p style="color:var(--text2)">Текущее значение по каждому из 8 параметров, список ID датчиков narodmon с расстоянием и возрастом последнего показания (датчики, отбракованные проверкой "сломанный ноль", помечены так же, как на служебном экране), плюс блок с данными Яндекс.Погоды. Обновляется автоматически каждые 15 секунд, есть и кнопка "Обновить" для немедленного запроса.</p>
+  </div>
+
+  <div class="card">
+    <h3>Вкладка "Логи" — /logs</h3>
+    <p style="color:var(--text2)">Строки лога за последние 5 минут — то же самое, что видно в Serial Monitor (кольцевой буфер в оперативной памяти устройства, ничего не пишется на флеш). Обновляется <strong>только по кнопке "Обновить"</strong> — сознательно без автополлинга, чтобы не грузить устройство лишними запросами при открытой в фоне вкладке.</p>
+  </div>
+
+  <div class="card">
+    <h3>Новые настройки этого раздела</h3>
+    <table class="set-table">
+      <tr><th>Параметр</th><th>По умолчанию</th><th>Смысл</th></tr>
+      <tr><td>WIFI_CONNECT_TIMEOUT_MIN</td><td>10 минут</td><td>Сколько ждать после включения, прежде чем поднять точку доступа (см. выше — только для первого подключения)</td></tr>
+      <tr><td>AP_SSID / AP_PASSWORD</td><td>WeatherDisplay-Setup / 12345678</td><td>Имя и пароль точки доступа для настройки; пароль — минимум 8 символов (требование WPA2)</td></tr>
+      <tr><td>WEB_ADMIN_PASSWORD</td><td>пусто</td><td>Пароль на весь веб-интерфейс (HTTP Basic Auth, логин admin); пусто = без пароля</td></tr>
+    </table>
+  </div>
+</section>
+
+</div>
+
+<footer>Погодный дисплей v4 · narodmon.ru + Яндекс.Погода + веб-интерфейс · ESP32 + ST7789</footer>
+
+<script>
+function copyCode(btn) {
+  const pre = btn.closest('.code-block').querySelector('pre');
+  navigator.clipboard.writeText(pre.innerText).then(() => {
+    btn.textContent = 'скопировано ✓';
+    setTimeout(() => btn.textContent = 'копировать', 2000);
+  });
+}
+</script>
+</body>
+</html>

@@ -1,66 +1,91 @@
-# Weather display v3 — ESP32 + ST7789 (narodmon.ru + Yandex.Weather)
+# Погодный дисплей на ESP32 + ST7789 (narodmon.ru + Яндекс.Погода)
 
-A standalone ESP32 weather display that combines readings from nearby public sensors on [narodmon.ru](https://narodmon.ru) with forecast data from Yandex.Weather, shown on a TFT screen as a carousel of 6 large, easy-to-read screens.
+Автономное устройство на ESP32, которое забирает показания ближайших публичных датчиков с проекта [narodmon.ru](https://narodmon.ru) (температура, влажность, давление, ветер, радиация, запылённость, осадки), усредняет их с весом по расстоянию, дополняет прогнозом от Яндекс.Погоды и показывает всё это на TFT-экране в виде карусели крупных, легко читаемых экранов. WiFi и остальные настройки задаются один раз через встроенный веб-интерфейс при первоначальной настройке, без переподключения к компьютеру.
 
-Author: **xumbax**
+Автор: **xumbax**
 
-![Temperature and humidity screen](images/screen_temp_humidity.png)
+![Экран температуры](images/screen_temperature.png)
 
-## Why v3
+## Зачем
 
-The previous version mixed in Open-Meteo as a third data source — this release drops it entirely in favor of a tighter two-source design: narodmon for hyper-local sensor data, Yandex.Weather for forecast. The sensor-discovery logic was also reworked to be adaptive rather than fixed, and wind direction got a proper vector-based "prevailing direction" treatment instead of a meaningless trend bar.
+Готовых метеостанций с такими данными по соседним датчикам в продаже не нашлось, а ставить свой собственный набор датчиков (термометр, барометр, анемометр, дозиметр) — избыточно, если рядом уже есть десятки чужих публичных приборов на narodmon. Идея — взять несколько ближайших датчиков каждого типа и усреднить их с весом по расстоянию, чтобы получить более устойчивый к выбросам результат, чем от одного случайного прибора, и дополнить это прогнозом от Яндекс.Погоды там, где соседских датчиков физически быть не может (прогноз на будущее).
 
-This release also went through a cleanup pass: a few functions and struct fields left over from earlier iterations (an unused GraphQL-era POST helper, an unused haversine-distance function, a couple of fields that were parsed but never displayed) were removed, and header/inline comments that had drifted out of sync with the actual code were corrected.
+## Возможности
 
-## Features
+- **8 параметров narodmon**: температура, влажность, давление, скорость и направление ветра, радиационный фон, запылённость воздуха, осадки
+- **Комнатный датчик DHT11** — температура и влажность прямо в помещении, независимо от WiFi и narodmon (работает даже офлайн)
+- **Взвешенное усреднение (IDW)** — `w = 1 / (d + ε)^p`, чем ближе датчик, тем больше его вес; число используемых датчиков, степень затухания и радиус поиска настраиваются без перепрошивки
+- **Адаптивный радиус поиска** — старт с 10 км, расширение по 15 км, пока не наберётся 2 датчика на тип (потолок 100 км); значение на экране появляется уже при 1 датчике. Если по какому-то параметру 30+ минут нет свежих данных (датчики перестали отвечать) — его ростер сбрасывается и поиск стартует заново с базового радиуса
+- **Яндекс.Погода** (бесплатный тариф "для умного дома") — погода на момент запроса, ближайший прогнозный час к "+2 часа от сейчас" и прогноз на сегодня/завтра
+- **Восход/закат и фаза Луны считаются на устройстве** — стандартные астрономические формулы по координатам и времени, без интернета и без внешнего API
+- **Карусель из 9 экранов** — DHT11 (комнатная темп-ра+влажность), температура на каждом из 5 экранов датчиков/расчётов в паре с влажностью+давлением, направлением+скоростью ветра, радиацией+загрязнённостью воздуха, иконкой погоды (солнце/облачно/дождь/снег/гроза)+осадками, восходом-закатом+фазой Луны; плюс два экрана Яндекса и служебный
+- **Мини-иконки состояния параметра** прямо в блоках датчиков — цвет/форма меняются от показания: радиация (зелёный/жёлтый/красный), ветер (виндсок), пыль (сетка точек), влажность (капля), давление (стрелки), DHT11 (домик)
+- **Тренд-бар на всю ширину экрана**, переживает перезагрузку — в том числе внезапную по питанию: 32 столбика по 45 минут (24 часа охвата) сохраняются в NVS-памяти при каждом закрытии столбика (запись синхронная, физически на флеше сразу), теряется максимум текущий незакрытый столбик; разрыв (например, устройство было надолго выключено) заполняется серыми столбиками "средней" высоты, а не обрывается
+- **Веб-интерфейс** — просмотр текущих показаний датчиков (включая DHT11) и лог за 5 минут доступны всегда; редактирование настроек (WiFi, ключи, пороги и т.д.) — только пока устройство раздаёт свою точку доступа для первоначальной настройки (подробности ниже)
+- **Тревоги подтверждаются вторым опросом подряд** — единичный всплеск не поднимает тревогу сразу, цифра лишь подсвечивается синим; только повторное показание за порогом делает её красной и включает LED с писком. При срабатывании — точечно, красной становится только цифра конкретного параметра
+- **Единая индикация связи** — нет WiFi, не отвечает API или нет свежих данных от датчиков дают одинаковый паттерн (импульс 300 мс раз в 5 сек), включается через 5 минут непрерывной проблемы; если проблема держится дольше 15 минут — устройство перезагружается само. Индикация связи никогда не перебивает горение LED при активном алерте
+- **Обычная (не тач) кнопка** — короткое нажатие переключает экраны на 30 секунд, потом автокарусель продолжает с того места; долгое нажатие (от 3 секунд) на экране с алертом заносит в чёрный список конкретный датчик narodmon, чьё показание дальше всего ушло за порог — дальше он игнорируется, как будто его не существует (на диагностическом экране то же долгое нажатие сбрасывает весь список). То же самое — клик по датчику и кнопка сброса — доступно и на вкладке "Датчики" веб-интерфейса
+- **Ощущается как (Яндекс)** — если данные пришли, маленьким серым числом справа от температуры narodmon на всех основных экранах
+- **При включении** — одно мигание светодиодом (проверка, что устройство ожило), без писка
 
-- **Adaptive search radius per parameter** — starts at 10 km, expands by 15 km steps (up to 100 km) only for parameter types still short on sensors, stops once 2 sensors are found. A value is shown on screen with just 1 sensor — N/D only when there are truly none nearby.
-- **"Oldest data first" sensor polling** — instead of simple round-robin, every minute the 3 sensors with the stalest known readings are queried (narodmon's API limit is 3 sensors per request), with a 5-minute-per-sensor cooldown so a sensor isn't hammered just because it's technically "oldest".
-- **Broken-zero sensor detection** — if 2+ sensors of the same type are fresh and one reads exactly 0.0 while another differs by more than a configurable threshold, the zero reading is excluded from averaging instead of skewing the result.
-- **6 screens, grouped by meaning**: Temperature+Humidity, Wind+Direction+Pressure, Air Quality+Radiation+Precipitation, Yandex current+2h-ahead forecast, Yandex 2-day forecast, diagnostics.
-- **Wind direction done right** — a vector sum of direction samples (not a naive average, which would turn 350° and 10° into "south") gives a proper prevailing direction. The screen shows current direction, the 1-hour vector average right next to it, and three text labels (24h/12h/6h) instead of a jittery trend bar.
-- **Per-parameter alerts, not full-screen** — when a threshold is crossed, only that parameter's number turns red. The LED lights solid only while an alert screen is being shown; the buzzer beeps once per screen display, throttled to at most once every 15 minutes across all alerts combined.
-- **Adaptive Yandex.Weather scheduling** — instead of a fixed interval, the next request is scheduled for exactly 30 minutes before the current "+2h" forecast slot expires, keeping the displayed forecast always within a tight, predictable margin while staying well under the free tier's 30 requests/day limit.
-- **TTP223 touch button** — a tap forces screen 0 and opens a 30-second manual-navigation window; further taps within that window step through screens; after 30 seconds of inactivity the regular carousel resumes from wherever it was left.
-- **No Cyrillic on screen** — TFT_eSPI's built-in font has no Cyrillic glyphs, so all on-screen text is English; logs to Serial Monitor remain in Russian for readability during setup.
+## Веб-интерфейс
 
-## Screens
+На домашней WiFi по IP-адресу устройства (виден на служебном экране карусели или в Serial Monitor при старте) доступны две вкладки:
 
-| Temp / Humidity | Wind / Direction / Pressure | Diagnostics |
+| Вкладка | Адрес | Что там |
 |---|---|---|
-| ![temp/humidity](images/screen_temp_humidity.png) | ![wind/pressure](images/screen_wind_pressure.png) | ![diagnostics](images/screen_diagnostics.png) |
+| Датчики | `/sensors` | Текущие значения по всем 8 параметрам, ID и возраст показаний использованных датчиков narodmon, данные Яндекса, комнатная температура/влажность с DHT11. Обновляется автоматически раз в 15 сек. |
+| Логи | `/logs` | Строки лога за последние 5 минут (то же, что видно в Serial Monitor). Обновляется только по кнопке "Обновить". |
 
-*These images are illustrative mockups of the screen layout, not photos of an actual unit.*
+Вкладка **Настройки** (`/settings`) на домашней WiFi недоступна — заход туда просто перенаправит на "Датчики". Она открыта только пока устройство раздаёт свою собственную точку доступа для первоначальной настройки — так WiFi-пароль и API-ключи не висят доступными постоянно.
 
-## Hardware
+**Первая настройка без компьютера.** Если после включения устройство **ни разу** не смогло подключиться к WiFi в течение `WIFI_CONNECT_TIMEOUT_MIN` минут (по умолчанию 10), оно само поднимает точку доступа — SSID и пароль показаны прямо на экране, там же и адрес `192.168.4.1` для входа в настройки. Подключитесь к этой сети телефоном или ноутбуком, откройте указанный адрес (на многих телефонах откроется само), впишите домашний WiFi и остальные параметры, сохраните — устройство перезагрузится, попробует подключиться снова, и вкладка "Настройки" на домашней WiFi уже не появится.
 
-- ESP32 DevKit (any WROOM-32 based board)
-- 2.0" ST7789 TFT display, 240×320, SPI
-- LED + 220 Ω resistor
-- 5V active piezo buzzer
-- TTP223 touch sensor module
+Это **строго одноразовый сценарий начальной настройки**: если WiFi обрывается позже, уже после того как устройство хотя бы раз успешно подключилось — оно просто продолжает бесконечно переподключаться в фоне, не уходя в режим точки доступа и не прерывая показ карусели.
 
-## Setup
+> **Про безопасность.** Пока идёт настройка через точку доступа, страница показывает WiFi-пароль и API-ключи открытым текстом (это нужно, чтобы их можно было проверить/изменить). При необходимости — задайте пароль веб-интерфейса на время настройки (`WEB_ADMIN_PASSWORD` на той же странице настроек, логин всегда `admin`).
 
-1. Arduino IDE + ESP32 board package
-2. Libraries: `TFT_eSPI` (Bodmer), `ArduinoJson` v6 (Benoit Blanchon), `NTPClient` (Fabrice Weinberg)
-3. Configure `User_Setup.h` in the `TFT_eSPI` library for an ST7789 240×320 display
-4. Open `weather_display.ino` and fill in:
-   - `WIFI_SSID`, `WIFI_PASS`
-   - `NM_API_KEY` — narodmon.ru → Profile → My applications
-   - `YANDEX_WEATHER_KEY` — Yandex developer console → Weather Data API → free "smart home" tier
-   - `MY_LAT`, `MY_LON` — coordinates of your observation point
-5. Flash, then open Serial Monitor at 115200 baud
+## Экраны
 
-## API limits and access notes
+| Обычный параметр | Служебный экран | Тревога |
+|---|---|---|
+| ![температура](images/screen_temperature.png) | ![служебный](images/screen_service.png) | ![тревога](images/screen_alarm.png) |
 
-- **narodmon**: accessing more than 3 other people's public sensors per request requires support approval — this firmware respects the 3-per-request cap by design (`fetchOldestSensors` always queries at most 3 IDs at a time).
-- **Yandex.Weather free tier**: 30 requests/day, forecast limited to today + tomorrow (not tomorrow + day-after, despite how that might sound — `limit=2` in their API means "today and tomorrow"). The adaptive scheduling in this firmware uses roughly 16 requests/day, comfortably under the cap.
+*Изображения — иллюстративный макет разметки экрана, не фото реального устройства.*
 
-## License
+## Железо
 
-MIT — use, modify, and distribute freely.
+- ESP32 DevKit (любой с WROOM-32)
+- TFT-дисплей 2.0" ST7789 240×320, SPI
+- Датчик DHT11 (комнатная температура/влажность)
+- Светодиод + резистор 220 Ом
+- Активный пьезопищалка 5V
+- Обычная тактовая кнопка (не сенсорная, без фиксации)
 
-## Acknowledgments
+Полная схема подключения, список покупок и настройка библиотеки `TFT_eSPI` — в [docs/weather_display_guide.html](docs/weather_display_guide.html).
 
-Data provided by [narodmon.ru](https://narodmon.ru) (crowdsourced environmental sensor network) and [Yandex.Weather](https://yandex.ru/dev/weather/).
+## Установка
+
+1. Arduino IDE + пакет плат ESP32
+2. Библиотеки: `TFT_eSPI` (Bodmer), `ArduinoJson` v6 (Benoit Blanchon), `NTPClient` (Fabrice Weinberg), `DHT sensor library` (Adafruit) + её зависимость `Adafruit Unified Sensor` — все через Library Manager; `WiFi.h`, `WiFiUDP.h`, `WebServer.h`, `DNSServer.h`, `Preferences.h`, `HTTPClient.h`, `MD5Builder.h` идут в комплекте с пакетом плат ESP32
+3. Настроить `User_Setup.h` библиотеки `TFT_eSPI` под пины вашего модуля (подробности в гайде)
+4. Подключить DHT11 к `PIN_DHT11` (по умолчанию GPIO 32, меняется в `/settings` при конфликте с разводкой экрана)
+5. Прошить `weather_display.ino` **как есть** — заполнять WiFi/ключи в коде больше не обязательно
+6. Открыть Serial Monitor на 115200 для диагностики, либо просто подождать: если WiFi не задан или недоступен, через 10 минут устройство поднимет точку доступа для настройки (см. раздел "Веб-интерфейс" выше)
+7. На этой точке доступа через `/settings` указать `NM_API_KEY` (narodmon.ru → Профиль → Мои приложения), `YANDEX_WEATHER_KEY`, координаты `MY_LAT`/`MY_LON` (также используются для расчёта восхода/заката) и домашний WiFi
+
+Настройки в коде (блок `SETTINGS` в начале `.ino`) остаются как значения по умолчанию на случай, если в NVS ещё ничего не сохранено — можно по-прежнему прошивать с заполненными вручную значениями, если так удобнее.
+
+## Лимиты API narodmon
+
+Проект использует метод `sensorsNearby` для одновременного запроса нескольких ближайших публичных датчиков. По правилам narodmon доступ к данным **более 3 чужих публичных датчиков** требует согласования с технической поддержкой проекта (заявка с описанием использования). Это устройство по умолчанию использует до 3 ближайших датчиков на каждый из 8 параметров — настройка `NEAREST_COUNT` (теперь и через веб-интерфейс) позволяет работать без отдельного согласования, либо обратиться в поддержку narodmon с описанием проекта.
+
+Запросы выполняются не чаще 1 раза в минуту с одного ключа — лимит API соблюдается настройкой `REQUEST_PERIOD_MIN`/`REQUEST_OFFSET_MIN`.
+
+## Лицензия
+
+MIT — используйте, модифицируйте, распространяйте свободно.
+
+## Благодарности
+
+Данные предоставлены проектом [narodmon.ru](https://narodmon.ru) — народный мониторинг погодных и экологических параметров — и сервисом Яндекс.Погода.

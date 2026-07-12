@@ -935,6 +935,7 @@ String httpGet(const String& url, const char* extraHeaderName = nullptr, const c
   } else {
     WiFiClient client;
     http.setConnectTimeout(10000);
+    http.setTimeout(10000); // тот же риск зависания, что был у nmPost() — на всякий случай, хоть этот путь сейчас и не используется (Яндекс всегда https)
     http.begin(client, url);
     http.addHeader("User-Agent","ESP32WeatherDisplay");
     if (extraHeaderName) http.addHeader(extraHeaderName, extraHeaderValue);
@@ -949,6 +950,14 @@ String httpGet(const String& url, const char* extraHeaderName = nullptr, const c
 
 String nmPost(const String& body) {
   WiFiClient client; HTTPClient http;
+  // КРИТИЧНО: явный таймаут — без него HTTPClient может ждать ответ от
+  // сервера практически неограниченно долго, замораживая ВЕСЬ loop()
+  // целиком (кнопку, веб-сервер, обновление экрана — всё разом), если
+  // narodmon.ru или сеть хоть раз подвиснут. Это самый частый сетевой
+  // вызов в проекте (sensorsValues — примерно раз в минуту), поэтому
+  // именно здесь риск зависания был самым высоким.
+  http.setConnectTimeout(10000);
+  http.setTimeout(10000);
   http.begin(client, "http://narodmon.ru/api");
   http.addHeader("Content-Type","application/json");
   http.addHeader("User-Agent","ESP32WeatherDisplay");

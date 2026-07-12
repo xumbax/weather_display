@@ -68,9 +68,11 @@
  *  overridden by a hard-priority solid light while an alarm is shown.
  *
  *  WEB INTERFACE: reachable any time the device has an IP (home WiFi or
- *  its own AP). Over the home WiFi, only /sensors and /logs are exposed;
- *  /settings is reachable only while running as its own AP (initial
- *  setup after WIFI_CONNECT_TIMEOUT_MIN minutes without a connection).
+ *  its own AP) — /sensors, /logs and /settings all always available;
+ *  Settings is deliberately the LAST tab (not the first) since it's the
+ *  least-often-needed one. Protect it with WEB_ADMIN_PASSWORD if the
+ *  network isn't fully trusted, since the page shows the WiFi password
+ *  and API keys in plain text.
  *
  *  BUTTON (regular momentary pushbutton, GND + INPUT_PULLUP): short press
  *  forces screen 0, opens a 30s manual-nav window; further short presses
@@ -187,7 +189,7 @@ float ALARM_HUM_HIGH_PCT   = 99.0;
 int PIN_LED    = 26;
 int PIN_BUZZER = 25;
 int PIN_TOUCH_BUTTON = 27; // обычная кнопка на GND, INPUT_PULLUP (нажатие = LOW)
-int PIN_DHT11 = 32; // датчик комнатной температуры/влажности; свободный GPIO по
+int PIN_DHT11 = 16; // датчик комнатной температуры/влажности; свободный GPIO по
                      // умолчанию — поменяйте в /settings, если конфликтует с вашей разводкой TFT
 unsigned long TOUCH_OVERRIDE_TIMEOUT_MS = 30UL * 1000; // 30 секунд
 int ALARM_BEEP_INTERVAL_SEC = 15 * 60;
@@ -244,6 +246,27 @@ enum WeatherIcon { WI_UNKNOWN, WI_SUN, WI_SUN_CLOUD, WI_CLOUD, WI_FOG, WI_RAIN, 
 // файле — сами структуры должны быть видны здесь.
 struct CivilDate { int year; int month; int day; };
 struct SunTimes { bool valid; float sunriseUtcHour; float sunsetUtcHour; };
+
+// Та же причина, что у типов выше: TrendBuffer используется как параметр
+// функции trendPush(), определённой намного позже в файле — сама
+// структура должна быть видна уже здесь.
+const int TREND_SLOT_MINUTES = 45;
+const int TREND_SLOT_COUNT   = 32; // 32 * 45 мин = 24 часа охвата
+
+struct TrendSlot {
+  long  slotIndex = -1; // unix_время/(45*60); -1 = слот ещё не использован
+  float value = 0;
+  bool  valid = false;
+  bool  isGap = false;  // true = слот заполнен НЕ настоящим измерением, а
+                         // средним значением при обнаружении разрыва (см. trendPush) —
+                         // на экране рисуется серым, а не обычным цветом
+};
+
+struct TrendBuffer {
+  TrendSlot slots[TREND_SLOT_COUNT];
+  int head = 0; // индекс САМОГО НОВОГО заполненного слота
+  int filledCount = 0; // сколько слотов реально когда-либо заполнено (для лога/диагностики)
+};
 
 struct SensorTypeConfig {
   const char* searchName;   // name to match in appInit types[]
@@ -323,6 +346,12 @@ WeatherIcon deriveWeatherIcon(); // возврат кастомного enum —
                                  // сгенерировать для такого корректный прототип
 CivilDate civilFromUnix(long unixTs);       // то же самое — возврат кастомного struct
 SunTimes calcSunriseSunset(double lat, double lon, int doy);
+void trendPush(TrendBuffer& buf, long nowTs, float v, const char* label); // параметр
+                                 // кастомного struct — та же причина, что и выше
+void drawFullWidthTrendGeneric(TrendBuffer& buf, float currentValue, int baseY,
+                                int maxBarHeight, uint16_t bg, uint16_t lastColor);
+void drawDhtValueBlock(const char* label, const char* unit, float value, bool valid,
+                        TrendBuffer& trend, int topY, int blockHeight, uint16_t bg);
 // ============================================================
 //  ТРЕНД-СЛОТЫ — фиксированные временные метки кратные 45 минутам от
 //  начала суток UTC (00:00, 00:45, 01:30, ...), а не "скользящее окно
@@ -341,26 +370,18 @@ SunTimes calcSunriseSunset(double lat, double lon, int doy);
 //  же, что был последним записанным) — двигаем "голову" буфера и
 //  записываем туда. Если тот же слот — обновляем значение в нём
 //  (берём последнее известное значение за эти 45 минут).
+//  (константы TREND_SLOT_MINUTES/COUNT и struct TrendSlot/TrendBuffer
+//  объявлены раньше в файле, рядом с SensorIndex — см. комментарий там;
+//  используются как параметр функции trendPush(), определённой позже)
 // ============================================================
-const int TREND_SLOT_MINUTES = 45;
-const int TREND_SLOT_COUNT   = 32; // 32 * 45 мин = 24 часа охвата
-
-struct TrendSlot {
-  long  slotIndex = -1; // unix_время/(45*60); -1 = слот ещё не использован
-  float value = 0;
-  bool  valid = false;
-  bool  isGap = false;  // true = слот заполнен НЕ настоящим измерением, а
-                         // средним значением при обнаружении разрыва (см. trendPush) —
-                         // на экране рисуется серым, а не обычным цветом
-};
-
-struct TrendBuffer {
-  TrendSlot slots[TREND_SLOT_COUNT];
-  int head = 0; // индекс САМОГО НОВОГО заполненного слота
-  int filledCount = 0; // сколько слотов реально когда-либо заполнено (для лога/диагностики)
-};
 
 TrendBuffer trendBuf[S_COUNT];
+
+// DHT11 не входит в систему narodmon (results[]/SensorIndex) — отдельная
+// пара тренд-буферов на комнатную температуру и влажность, тем же типом
+// TrendBuffer и той же функцией trendPush()/сохранением в NVS.
+struct DhtTrends { TrendBuffer temp; TrendBuffer hum; };
+DhtTrends dhtTrends;
 
 // Добавить новое значение в тренд-буфер параметра idx. Сама определяет,
 // попадает ли новое измерение в уже открытый текущий слот (обновляет
@@ -371,9 +392,8 @@ TrendBuffer trendBuf[S_COUNT];
 // промежуточные слоты заполняются "серыми" заглушками со значением,
 // равным среднему по уже накопленным ДОСТОВЕРНЫМ (не gap) слотам —
 // см. isGap и его отрисовку в drawFullWidthTrend().
-void trendPush(int idx, long nowTs, float v) {
+void trendPush(TrendBuffer& buf, long nowTs, float v, const char* label) {
   long slotIdx = nowTs / ((long)TREND_SLOT_MINUTES * 60);
-  TrendBuffer& buf = trendBuf[idx];
 
   if (buf.filledCount > 0 && buf.slots[buf.head].slotIndex == slotIdx) {
     // Тот же 45-минутный слот, что и в прошлый раз — просто обновляем значение
@@ -399,7 +419,7 @@ void trendPush(int idx, long nowTs, float v) {
         if (buf.filledCount < TREND_SLOT_COUNT) buf.filledCount++;
       }
       logPrintf("  [trend] %s: gap detected, filled %ld slot(s) with grey avg=%.1f\n",
-        sensorTypes[idx].shortLabel, fillCount, gapValue);
+        label, fillCount, gapValue);
     }
   }
 
@@ -409,23 +429,27 @@ void trendPush(int idx, long nowTs, float v) {
   if (buf.filledCount < TREND_SLOT_COUNT) buf.filledCount++;
 
   logPrintf("  [trend] %s: new slot opened, %d/%d filled\n",
-    sensorTypes[idx].shortLabel, buf.filledCount, TREND_SLOT_COUNT);
+    label, buf.filledCount, TREND_SLOT_COUNT);
 
   saveTrendsToNVS(); // пишем во флеш только при открытии НОВОГО слота (не на каждое
                       // обновление текущего) — ограничивает частоту записи в NVS
 }
 
 // ============================================================
-//  Сохранение/восстановление тренд-буфера в NVS — переживает
-//  перезагрузку. Пишем весь массив trendBuf[] одним блоком байт;
-//  на восстановлении сверяем размер (на случай будущих изменений
-//  структуры TrendSlot между версиями прошивки) — если не совпадает,
-//  просто игнорируем сохранённое и начинаем с чистого буфера, вместо
-//  того чтобы истолковать чужой формат как валидные данные.
+//  Сохранение/восстановление тренд-буферов в NVS — переживает
+//  перезагрузку. Народмон (trendBuf[S_COUNT]) и DHT11 (dhtTrends —
+//  два отдельных буфера, температура/влажность) пишутся отдельными
+//  ключами, но одновременно, при каждом открытии НОВОГО слота у
+//  любого из них. На восстановлении сверяем размер каждого блока
+//  (на случай будущих изменений структуры между версиями прошивки) —
+//  если не совпадает, просто игнорируем сохранённое и начинаем с
+//  чистого буфера, вместо того чтобы истолковать чужой формат как
+//  валидные данные.
 // ============================================================
 void saveTrendsToNVS() {
   prefs.begin("wdcfg", false);
   prefs.putBytes("trends", &trendBuf, sizeof(trendBuf));
+  prefs.putBytes("trends_dht", &dhtTrends, sizeof(dhtTrends));
   prefs.end();
 }
 
@@ -438,12 +462,20 @@ void loadTrendsFromNVS() {
   } else if (got > 0) {
     logPrintln("Trend history in NVS has unexpected size (firmware structure changed?), starting fresh");
   }
+  size_t gotDht = prefs.getBytesLength("trends_dht");
+  if (gotDht == sizeof(dhtTrends)) {
+    prefs.getBytes("trends_dht", &dhtTrends, sizeof(dhtTrends));
+    logPrintln("DHT11 trend history restored from NVS");
+  } else if (gotDht > 0) {
+    logPrintln("DHT11 trend history in NVS has unexpected size, starting fresh");
+  }
   prefs.end();
 }
 
-// Для совместимости с остальным кодом (вызывается как раньше из computeResults)
+// Для совместимости с остальным кодом (вызывается как раньше из computeResults) —
+// народмон-датчики по-прежнему адресуются индексом типа (SensorIndex)
 void historyPush(int idx, long t, float v) {
-  trendPush(idx, t, v);
+  trendPush(trendBuf[idx], t, v, sensorTypes[idx].shortLabel);
 }
 
 // ============================================================
@@ -1422,6 +1454,10 @@ void updateDHT11() {
   dhtTempC = t;
   dhtHumPct = h;
   dhtValid = true;
+
+  long nowTs = (long)timeClient.getEpochTime();
+  trendPush(dhtTrends.temp, nowTs, dhtTempC, "RoomTemp");
+  trendPush(dhtTrends.hum, nowTs, dhtHumPct, "RoomHum");
 }
 
 void computeResults() {
@@ -1701,14 +1737,14 @@ int trendLevel(float v, float vMin, float vMax) {
 
 // Рисует тренд-бар на всю ширину экрана (x=0..240) с базовой линией на y,
 // высотой столбиков вверх до maxBarHeight. idx — индекс параметра в trendBuf[].
-void drawFullWidthTrend(int idx, int baseY, int maxBarHeight, uint16_t bg, bool alarmColor) {
-  if (!results[idx].valid) return;
-
-  TrendBuffer& buf = trendBuf[idx];
+// Универсальная отрисовка тренд-бара — принимает буфер и текущее значение
+// напрямую, не завязана на results[]/SensorIndex. Используется и для
+// народмона (через обёртку ниже), и напрямую для DHT11.
+void drawFullWidthTrendGeneric(TrendBuffer& buf, float currentValue, int baseY, int maxBarHeight, uint16_t bg, uint16_t lastColor) {
   float vals[TREND_BARS_COUNT];
   bool  has[TREND_BARS_COUNT];
   bool  gap[TREND_BARS_COUNT];
-  float vMin = results[idx].value, vMax = results[idx].value;
+  float vMin = currentValue, vMax = currentValue;
 
   // k=0 — самый старый видимый слот (слева), k=TREND_BARS_COUNT-1 — самый
   // новый (справа). Буфер кольцевой, buf.head — индекс самого нового слота,
@@ -1726,7 +1762,6 @@ void drawFullWidthTrend(int idx, int baseY, int maxBarHeight, uint16_t bg, bool 
   }
 
   uint16_t normalColor = TFT_GREENYELLOW;
-  uint16_t lastColor = alarmColor ? TFT_RED : TFT_CYAN;
 
   for (int k = 0; k < TREND_BARS_COUNT; k++) {
     int bx = k * (TREND_BAR_W + TREND_BAR_GAP);
@@ -1738,6 +1773,14 @@ void drawFullWidthTrend(int idx, int baseY, int maxBarHeight, uint16_t bg, bool 
     else color = (k == TREND_BARS_COUNT - 1) ? lastColor : normalColor;
     tft.fillRect(bx, baseY - bh, TREND_BAR_W, bh, color);
   }
+}
+
+// Обёртка для народмона — прежняя сигнатура, чтобы не трогать вызовы из
+// drawParamBlock()
+void drawFullWidthTrend(int idx, int baseY, int maxBarHeight, uint16_t bg, bool alarmColor) {
+  if (!results[idx].valid) return;
+  uint16_t lastColor = alarmColor ? TFT_RED : TFT_CYAN;
+  drawFullWidthTrendGeneric(trendBuf[idx], results[idx].value, baseY, maxBarHeight, bg, lastColor);
 }
 
 // ============================================================
@@ -1948,14 +1991,16 @@ void iconHouse(int cx, int cy, uint16_t color) {
 // Блок в стиле drawParamBlock, но для локального DHT11 (не входит в
 // систему results[]/SensorIndex, т.к. это не датчик narodmon)
 void drawDhtValueBlock(const char* label, const char* unit, float value, bool valid,
-                        int topY, int blockHeight, uint16_t bg) {
+                        TrendBuffer& trend, int topY, int blockHeight, uint16_t bg) {
   int numY = topY + 4;
   tft.setTextSize(5);
   tft.setTextColor(valid ? TFT_WHITE : TFT_DARKGREY, bg);
   tft.setCursor(4, numY);
 
   char vbuf[16];
-  if (valid) { snprintf(vbuf, sizeof(vbuf), "%.1f", value); tft.print(vbuf); }
+  // DHT11 отдаёт только целые градусы/проценты — десятая доля всегда 0,
+  // поэтому показываем целым числом, без "лишних" ".0"
+  if (valid) { snprintf(vbuf, sizeof(vbuf), "%.0f", value); tft.print(vbuf); }
   else tft.print("N/D");
 
   int charWidthPx = 30; // 6px база * numTextSize(5), как в drawParamBlock
@@ -1968,14 +2013,22 @@ void drawDhtValueBlock(const char* label, const char* unit, float value, bool va
   int unitTextRightEdge = labelX + (int)strlen(unit) * 6;
 
   int numBottomY = numY + 8 * 5;
+  const int trendH = 26; // высота тренд-бара — как у обычных блоков drawParamBlock
   int trendBaseY = topY + blockHeight - 4;
-  int labelY = numBottomY + (trendBaseY - numBottomY) / 2 - 4;
+  int trendTopY  = trendBaseY - trendH; // верх зоны тренда — подпись должна кончаться ДО него
+  int labelY = numBottomY + (trendTopY - numBottomY) / 2 - 4; // центр зазора МЕЖДУ цифрой и трендом
   tft.setCursor(labelX, labelY);
   tft.print(label);
 
   // Иконка "домик" — та же безопасная зона и та же защита от наложения
   // на длинный текст, что и у мини-иконок датчиков narodmon
   if (unitTextRightEdge < 200) iconHouse(218, topY + 29, TFT_ORANGE);
+
+  // Тренд-бар — тот же формат и высота (26px), что у обычных блоков
+  // drawParamBlock; свой отдельный буфер (dhtTrends.temp / .hum), не
+  // завязан на results[]/SensorIndex, поэтому не рисовался раньше — это
+  // и была причина его отсутствия.
+  if (valid) drawFullWidthTrendGeneric(trend, value, trendBaseY, trendH, bg, TFT_CYAN);
 }
 
 int drawParamBlock(int idx, int topY, int blockHeight, bool bigNumber, uint16_t bg) {
@@ -2241,7 +2294,7 @@ void drawWeatherIconBlock(int topY, int blockHeight, uint16_t bg) {
     case WI_SUN_CLOUD:
       wiSun(cx-8, cy-6, TFT_YELLOW);
       wiCloud(cx+10, cy+8, TFT_LIGHTGREY);
-      label = "Partly Cloudy"; labelColor = TFT_LIGHTGREY;
+      label = "Sun+Cloud"; labelColor = TFT_LIGHTGREY;
       break;
     case WI_CLOUD:
       wiCloud(cx, cy, TFT_LIGHTGREY);
@@ -2275,9 +2328,9 @@ void drawWeatherIconBlock(int topY, int blockHeight, uint16_t bg) {
       break; // WI_UNKNOWN — нет данных, просто подпись N/D без картинки
   }
 
-  tft.setTextSize(3);
+  tft.setTextSize(2);
   tft.setTextColor(labelColor, bg);
-  tft.setCursor(96, topY + blockHeight/2 - 12);
+  tft.setCursor(96, topY + blockHeight/2 - 8);
   tft.print(label);
 
   tft.setTextSize(1);
@@ -2297,8 +2350,8 @@ void drawScreenRoomDht() {
   int y = HEADER_H + 2;
   int blockH = (320 - HEADER_H - 10) / 3;
   y = drawParamBlock(S_TEMP, y, blockH, false, bg); // народмон, как везде
-  drawDhtValueBlock("Room Temp", "C", dhtTempC,  dhtValid, y, blockH, bg); y += blockH;
-  drawDhtValueBlock("Room Hum",  "%", dhtHumPct, dhtValid, y, blockH, bg);
+  drawDhtValueBlock("Room Temp", "C", dhtTempC,  dhtValid, dhtTrends.temp, y, blockH, bg); y += blockH;
+  drawDhtValueBlock("Room Hum",  "%", dhtHumPct, dhtValid, dhtTrends.hum,  y, blockH, bg);
 
   drawCarouselDots(0);
 }
@@ -2811,13 +2864,21 @@ void updateCarousel() {
     delayS = screenHasVisibleAlarm(carouselIndex) ? DELAY_ALARM_SEC : DELAY_NORMAL_SEC;
   }
   if (millis()-lastCarouselSwitch < (unsigned long)delayS*1000UL) return;
-  lastCarouselSwitch = millis();
 
-  drawScreenByIndex(carouselIndex);
-
+  // Время ТЕКУЩЕГО (уже показанного) экрана истекло — сначала переходим на
+  // следующий и сразу его рисуем, и только ПОТОМ отсчитываем время заново.
+  // Раньше было наоборот (отрисовка старого индекса, потом сдвиг) — из-за
+  // этого delayS в следующий раз считался уже для НОВОГО индекса, а держалась
+  // на экране картинка предыдущего: длительность показа экрана N фактически
+  // бралась из настройки экрана N+1. Из-за этого, например, служебный экран
+  // (рисуется с DELAY_SERVICE_SEC) визуально держался столько же, сколько
+  // следующий за ним обычный экран (DELAY_NORMAL_SEC), а не свои 4 секунды.
   do {
     carouselIndex = (carouselIndex+1) % TOTAL_SCREENS;
   } while (!carouselScreenHasData(carouselIndex));
+
+  drawScreenByIndex(carouselIndex);
+  lastCarouselSwitch = millis();
 }
 // ============================================================
 //  ЛОГ-БУФЕР (для веб-вкладки "Логи") — кольцевой буфер строк с
@@ -2946,6 +3007,11 @@ DNSServer  dnsServer;
 unsigned long wifiConnectStartMs = 0;
 unsigned long lastApStaRetry     = 0;
 unsigned long lastApScreenRefresh= 0;
+unsigned long lastStaReconnectAttempt = 0; // неблокирующий повтор подключения после разрыва
+                                            // (см. loop() — блокирующая connectWiFi() здесь
+                                            // не годится, она держит цикл до 15 сек и всё
+                                            // это время кнопка не опрашивается вообще)
+const unsigned long STA_RECONNECT_INTERVAL_MS = 10000UL; // не чаще раза в 10 сек
 
 bool checkAuth() {
   if (WEB_ADMIN_PASSWORD.length() == 0) return true; // пароль не задан — без авторизации
@@ -2997,14 +3063,17 @@ String pageHeader(const char* active) {
   String cls_settings = (strcmp(active,"settings")==0) ? "active" : "";
   String cls_sensors  = (strcmp(active,"sensors")==0)  ? "active" : "";
   String cls_logs     = (strcmp(active,"logs")==0)     ? "active" : "";
-  String nav = "<nav>";
-  // Вкладка "Настройки" видна и доступна только пока устройство держит
-  // собственную точку доступа (первоначальная настройка). На домашней
-  // WiFi веб-интерфейс сознательно урезан до показаний и логов — так
-  // WiFi-пароль и API-ключи не висят доступными постоянно.
-  if (apModeActive) nav += "<a class='" + cls_settings + "' href='/settings'>Настройки</a>";
-  nav += "<a class='" + cls_sensors + "' href='/sensors'>Датчики</a>"
-         "<a class='" + cls_logs    + "' href='/logs'>Логи</a></nav>";
+  // "Настройки" — всегда доступна (и на домашней WiFi, и в режиме своей
+  // точки доступа), но намеренно ПОСЛЕДНЕЙ вкладкой: раньше она была видна
+  // только в AP-режиме, но это создавало замкнутый круг — чтобы поменять
+  // хоть одну настройку (например, пин датчика), приходилось сначала
+  // как-то попасть в AP-режим, а он сам включается только когда WiFi и
+  // так не работает. Пароль веб-интерфейса (WEB_ADMIN_PASSWORD) — то,
+  // чем стоит защититься теперь, раз страница всегда открыта.
+  String nav = "<nav>"
+    "<a class='" + cls_sensors  + "' href='/sensors'>Датчики</a>"
+    "<a class='" + cls_logs     + "' href='/logs'>Логи</a>"
+    "<a class='" + cls_settings + "' href='/settings'>Настройки</a></nav>";
   return String("<!DOCTYPE html><html><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<title>Weather Display</title>") + pageStyle() +
@@ -3020,24 +3089,14 @@ String row(const String& label, const String& name, const String& value, const S
 }
 
 void handleRoot() {
-  // На домашней WiFi настроек нет — сразу на показания; в режиме своей
-  // точки доступа (первоначальная настройка) логично начать с настроек.
+  // В режиме своей точки доступа (первоначальная настройка) логичнее
+  // сразу открыть настройки; на домашней WiFi — показания (основной
+  // экран), настройки теперь всегда в одном клике на последней вкладке.
   server.sendHeader("Location", apModeActive ? "/settings" : "/sensors", true);
   server.send(302, "text/plain", "");
 }
 
-// Общая проверка для /settings: доступны ТОЛЬКО пока устройство держит
-// свою точку доступа. На домашней WiFi — вежливый редирект на показания,
-// а не 404/403, т.к. это обычно случайный переход по старой закладке.
-bool requireApMode() {
-  if (apModeActive) return true;
-  server.sendHeader("Location", "/sensors", true);
-  server.send(302, "text/plain", "");
-  return false;
-}
-
 void handleSettingsGet() {
-  if (!requireApMode()) return;
   if (!checkAuth()) return;
   String h = pageHeader("settings");
   h += "<form method='POST' action='/settings'>";
@@ -3150,7 +3209,6 @@ void setULong(const char* argName, const char* nvsKey, unsigned long& target) {
 }
 
 void handleSettingsPost() {
-  if (!requireApMode()) return;
   if (!checkAuth()) return;
   prefs.begin("wdcfg", false);
 
@@ -3463,10 +3521,13 @@ void drawScreenApSetup() {
   tft.setCursor(4,32); tft.println("Setup mode. To configure:");
 
   tft.setCursor(4,50); tft.println("1. Connect to WiFi network:");
-  tft.setTextColor(TFT_GREENYELLOW, TFT_BLACK); tft.setTextSize(2);
-  tft.setCursor(4,62); tft.println(AP_SSID);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK); tft.setTextSize(1);
-  tft.setCursor(4,84); tft.print("Password: "); tft.println(AP_PASSWORD);
+  // SSID/пароль — значения из /settings, длина заранее неизвестна (даже
+  // дефолтный SSID "WeatherDisplay-Setup", 20 символов, уже переполнял
+  // экран при более крупном шрифте) — намеренно мельче остального текста
+  tft.setTextColor(TFT_GREENYELLOW, TFT_BLACK); tft.setTextSize(1);
+  tft.setCursor(4,64); tft.println(AP_SSID);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setCursor(4,76); tft.print("Password: "); tft.println(AP_PASSWORD);
 
   tft.setCursor(4,104); tft.println("2. Open in browser:");
   tft.setTextColor(TFT_GREENYELLOW, TFT_BLACK); tft.setTextSize(2);
@@ -3596,7 +3657,18 @@ void loop() {
         connectWiFi(); // блокирующая попытка ~15 сек, как раньше
       }
     } else {
-      connectWiFi(); // уже подключались раньше — обычный бесконечный ретрай, без AP
+      // Уже подключались раньше — обычный ретрай, НО без блокировки: раньше
+      // здесь стояла connectWiFi() с внутренним ожиданием до 15 сек, из-за
+      // чего на нестабильном WiFi (обрывы через сутки-двое — обычное дело
+      // для многих роутеров) кнопка переставала отвечать почти совсем —
+      // handleTouchButton() просто не успевал вызываться. Теперь — только
+      // редкий "пинок" переподключения раз в STA_RECONNECT_INTERVAL_MS,
+      // без ожидания результата; loop() продолжает идти дальше как обычно.
+      if (millis() - lastStaReconnectAttempt > STA_RECONNECT_INTERVAL_MS) {
+        lastStaReconnectAttempt = millis();
+        WiFi.begin(WIFI_SSID.c_str(), WIFI_PASS.c_str());
+        logPrintln("WiFi: reconnect attempt (неблокирующий)");
+      }
     }
   } else {
     // В AP-режиме раз в 30 секунд незаметно пробуем восстановить основную

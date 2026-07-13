@@ -100,6 +100,8 @@
 #include <MD5Builder.h>
 #include <TFT_eSPI.h>
 #include <DHT.h> // Adafruit "DHT sensor library" (+ зависимость "Adafruit Unified Sensor") — комнатный датчик
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h> // фоновая задача для сетевых запросов narodmon/Яндекс — см. networkTaskFn
 #include <Preferences.h>
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -352,6 +354,7 @@ void drawFullWidthTrendGeneric(TrendBuffer& buf, float currentValue, int baseY,
                                 int maxBarHeight, uint16_t bg, uint16_t lastColor);
 void drawDhtValueBlock(const char* label, const char* unit, float value, bool valid,
                         TrendBuffer& trend, int topY, int blockHeight, uint16_t bg);
+void networkTaskFn(void* pvParameters); // фоновая FreeRTOS-задача, запускается из setup()
 // ============================================================
 //  ТРЕНД-СЛОТЫ — фиксированные временные метки кратные 45 минутам от
 //  начала суток UTC (00:00, 00:45, 01:30, ...), а не "скользящее окно
@@ -842,6 +845,11 @@ bool wifiEverConnectedSinceBoot = false; // как только один раз 
                                           // без этого флага любой ПОЗДНИЙ обрыв связи (после
                                           // многих часов работы) тоже бы уходил в AP почти сразу,
                                           // т.к. таймер сравнивается с millis() от старта устройства
+uint32_t minFreeHeapSeen = UINT32_MAX; // минимум ESP.getFreeHeap() за всё время работы — если
+                                        // заметно и без остановки падает со временем, это
+                                        // фрагментация/утечка кучи, а не разовый сбой
+unsigned long lastHeapLogMs = 0;
+const unsigned long HEAP_LOG_INTERVAL_MS = 5UL * 60 * 1000; // раз в 5 минут — временной ряд в логе
 // ============================================================
 //  UTILITIES
 // ============================================================
@@ -1434,6 +1442,21 @@ void checkStaleTypesWatchdog() {
   }
 }
 
+// Отслеживание свободной памяти — диагностика для отчётов вида "через
+// час-два часть функций (кнопка, веб-интерфейс) перестаёт отвечать до
+// перезагрузки". Пишем временной ряд в лог раз в 5 минут и запоминаем
+// минимум за всё время работы — устойчиво падающий минимум без
+// восстановления укажет на фрагментацию/утечку кучи.
+void updateHeapDiagnostics() {
+  uint32_t freeHeap = ESP.getFreeHeap();
+  if (freeHeap < minFreeHeapSeen) minFreeHeapSeen = freeHeap;
+
+  if (millis() - lastHeapLogMs > HEAP_LOG_INTERVAL_MS) {
+    lastHeapLogMs = millis();
+    logPrintf("  [heap] free=%u min=%u uptime=%lum\n", freeHeap, minFreeHeapSeen, millis()/60000UL);
+  }
+}
+
 // ============================================================
 //  DHT11 — локальный комнатный датчик температуры/влажности. Работает
 //  независимо от WiFi/narodmon (даже офлайн, в режиме точки доступа).
@@ -1861,8 +1884,12 @@ void iconWindsock(int cx, int cy, float speedMs) {
   float t = speedMs / ALARM_WIND_MS;
   if (t < 0) t = 0;
   if (t > 1) t = 1;
-  int droop = (int)((1.0f - t) * 8); // слабый ветер — конус провисает вниз
-  int reach = 6 + (int)(t * 12);     // сильный ветер — конус вытягивается по горизонтали
+  // sqrt — иначе на линейной шкале, растянутой на весь диапазон до
+  // ALARM_WIND_MS (20 м/с), бытовые скорости 0-8 м/с почти не двигали
+  // стрелку (разница была всего 1-2px между 0 и 4 м/с) — теперь заметнее
+  t = sqrt(t);
+  int droop = (int)((1.0f - t) * 10); // слабый ветер — конус провисает вниз
+  int reach = 4 + (int)(t * 18);      // сильный ветер — конус вытягивается по горизонтали
   int mastX = cx - 14, mastTopY = cy - 12;
   tft.drawFastVLine(mastX, mastTopY, 24, TFT_WHITE); // мачта
   int tipX = mastX + reach, tipY = mastTopY + 2 + droop;
@@ -1893,9 +1920,22 @@ void iconDust(int cx, int cy, float value) {
 
 // Настоящая капля-"слеза": скруглённый низ (круг) + заострённый верх
 // (треугольник, смыкающийся с верхней частью круга) — не "груша" из двух
-// кружков разного размера.
+// кружков разного размера. Цвет теперь тоже меняется от влажности — от
+// бледно-серо-голубого (сухо) до насыщенного синего (влажно), в дополнение
+// к форме (контур/толстый контур/заливка).
+uint16_t humidityGradientColor(float humidity) {
+  float t = humidity / 100.0f;
+  if (t < 0) t = 0;
+  if (t > 1) t = 1;
+  // 0%: бледный серо-голубой (200,200,210) -> 100%: насыщенный синий (20,80,210)
+  uint8_t r = (uint8_t)(200 - t * 180);
+  uint8_t g = (uint8_t)(200 - t * 120);
+  uint8_t b = (uint8_t)(210 + t * 0); // остаётся высоким на всём диапазоне
+  return tft.color565(r, g, b);
+}
+
 void iconHumidityDrop(int cx, int cy, float humidity) {
-  uint16_t color = TFT_SKYBLUE;
+  uint16_t color = humidityGradientColor(humidity);
   int r = 7;
   int tipY = cy - r - 8; // вершина капли
 
@@ -2615,10 +2655,19 @@ void drawScreenService() {
   tft.setCursor(4,HEADER_H+24);
   if (WiFi.status()==WL_CONNECTED) tft.print("Web: " + WiFi.localIP().toString());
   else tft.print("Web: not connected");
-  tft.drawFastHLine(0,HEADER_H+34,240,TFT_DARKGREY);
+
+  // Свободная память — диагностика зависаний "работает час-другой, потом
+  // часть функций отваливается до перезагрузки": если Heap заметно падает
+  // со временем без восстановления, это фрагментация кучи, а не разовый сбой.
+  uint32_t freeHeap = ESP.getFreeHeap();
+  tft.setTextColor(freeHeap < 20000 ? TFT_RED : TFT_WHITE, bg);
+  tft.setCursor(4,HEADER_H+34);
+  tft.printf("Heap: %u B (min %u)", freeHeap, minFreeHeapSeen);
+
+  tft.drawFastHLine(0,HEADER_H+44,240,TFT_DARKGREY);
 
   long nowTs = (long)timeClient.getEpochTime();
-  int y = HEADER_H + 42;
+  int y = HEADER_H + 52;
   for (int i=0; i<S_COUNT; i++) {
     if (y>300) break;
     tft.setTextColor(TFT_WHITE,bg);
@@ -2894,25 +2943,38 @@ void updateCarousel() {
 //  таймстампом millis(). logPrintln/logPrintf — замена Serial.println/
 //  Serial.printf по всему файлу: пишут и в Serial (как раньше), и сюда.
 //  /api/logs отдаёт только записи не старше 5 минут.
+//
+//  Строки — ФИКСИРОВАННЫЕ char[], не String: раньше здесь на каждую
+//  запись лога происходило выделение/освобождение памяти в куче (String
+//  copy-assignment), а логов теперь пишется много (тренды по 2 буферам,
+//  чёрный список, DHT11, WiFi, каждый HTTP-запрос и т.д.) — постоянное
+//  дробление кучи именно такими мелкими короткоживущими аллокациями
+//  является известной причиной случайных зависаний ESP32 после многих
+//  часов работы. Фиксированный буфер выделяется один раз при старте и
+//  больше не трогает кучу вообще.
 // ============================================================
+const int LOG_LINE_MAXLEN = 140; // с запасом на большинство сообщений; более
+                                  // длинные (редкие) просто обрежутся без сбоя
 struct LogEntry {
   unsigned long ms;
-  String line;
+  char line[LOG_LINE_MAXLEN];
 };
 const int LOG_BUFFER_SIZE = 400; // с запасом на 5 минут при обычной частоте событий
 LogEntry logBuffer[LOG_BUFFER_SIZE];
 int logHead  = 0; // индекс СЛЕДУЮЩЕЙ свободной ячейки (циклически)
 int logCount = 0; // сколько реально заполнено (<= LOG_BUFFER_SIZE)
 
-void logRingPush(const String& s) {
-  logBuffer[logHead] = { millis(), s };
+void logRingPush(const char* s) {
+  logBuffer[logHead].ms = millis();
+  strncpy(logBuffer[logHead].line, s, LOG_LINE_MAXLEN - 1);
+  logBuffer[logHead].line[LOG_LINE_MAXLEN - 1] = '\0'; // гарантируем терминатор даже при обрезании
   logHead = (logHead + 1) % LOG_BUFFER_SIZE;
   if (logCount < LOG_BUFFER_SIZE) logCount++;
 }
 
 void logPrintln(const String& s) {
   Serial.println(s);
-  logRingPush(s);
+  logRingPush(s.c_str());
 }
 
 void logPrintf(const char* fmt, ...) {
@@ -2922,9 +2984,11 @@ void logPrintf(const char* fmt, ...) {
   vsnprintf(buf, sizeof(buf), fmt, args);
   va_end(args);
   Serial.print(buf);
-  String s(buf);
-  s.trim(); // убираем завершающий \n — в буфере одна запись = одна строка
-  logRingPush(s);
+  // убираем завершающий \n/\r — в буфере одна запись = одна строка (без
+  // лишнего String(buf) + trim(), как было раньше — та же экономия кучи)
+  size_t len = strlen(buf);
+  while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r')) { buf[--len] = '\0'; }
+  logRingPush(buf);
 }
 
 // HH:MM:SS в дисплейном часовом поясе (TZ_DISPLAY_OFFSET_HOURS), как в шапке экрана
@@ -3311,7 +3375,7 @@ void handleSensorsPage() {
        "}"
        "function load(){"
        "fetch('/api/sensors').then(r=>r.json()).then(d=>{"
-       "var h='<p>Обновлено: '+esc(d.now)+'</p>';"
+       "var h='<p>Обновлено: '+esc(d.now)+' &middot; Heap: '+d.freeHeap+' B (min '+d.minFreeHeap+') &middot; Uptime: '+d.uptimeMin+'м</p>';"
        "h+='<h2 style=\"color:#9cf\">Комнатный датчик (DHT11)</h2>';"
        "if(d.room.valid) h+='<p>'+d.room.tempC+'&deg;C, влажность '+d.room.humPct+'%</p>';"
        "else h+='<p>Нет данных (датчик не отвечает)</p>';"
@@ -3345,6 +3409,9 @@ void handleApiSensors() {
   DynamicJsonDocument doc(6144);
   long nowTs = (long)timeClient.getEpochTime();
   doc["now"] = formatHHMMSS(nowTs);
+  doc["freeHeap"] = ESP.getFreeHeap();
+  doc["minFreeHeap"] = minFreeHeapSeen;
+  doc["uptimeMin"] = millis() / 60000UL;
 
   JsonObject room = doc.createNestedObject("room");
   room["valid"] = dhtValid;
@@ -3647,6 +3714,105 @@ void setup() {
 
   drawScreenRoomDht();
   lastCarouselSwitch = millis();
+
+  // Фоновая задача сетевых запросов — см. комментарий у networkTaskFn ниже.
+  // Создаём в самом конце setup(), когда все нужные ей глобальные переменные
+  // (WiFi, конфиг, тренды и т.д.) уже проинициализированы.
+  xTaskCreatePinnedToCore(networkTaskFn, "NetTask", 8192, NULL, 1, NULL, 1);
+}
+
+// ============================================================
+//  ФОНОВАЯ ЗАДАЧА (FreeRTOS) — все блокирующие HTTP-запросы к narodmon и
+//  Яндекс.Погоде теперь выполняются ЗДЕСЬ, а не в основном loop(). Раньше
+//  это всё стояло прямо в loop(), и на время КАЖДОГО запроса (даже
+//  успешного, не зависшего — обычный сетевой round-trip занимает секунды)
+//  ничего другого не обрабатывалось вообще: ни кнопка, ни веб-сервер.
+//
+//  Задача закреплена на том же ядре, что и loop() (Core 1) — сознательный
+//  компромисс. Настоящее разделение по ядрам (Core 0) дало бы чуть более
+//  гладкую работу, но ценой реального риска гонки данных: loop() читает
+//  results[]/nmCache[]/yandexNow и т.п. как раз в те моменты, когда эта
+//  задача их обновляет. На одном ядре FreeRTOS переключается между
+//  задачами предсказуемо и только в определённых точках — риск не нулевой
+//  (запись в многополевую структуру теоретически может быть прервана
+//  переключением), но значительно меньше, чем при истинном параллелизме
+//  на двух ядрах. Полноценная защита мьютексами по каждой переменной —
+//  отдельная, более крупная и рискованная переделка; если на практике
+//  проявятся именно эффекты гонки (не путать с обычными "не долетели
+//  свежие данные") — тогда есть смысл её делать.
+// ============================================================
+void networkTaskLoop() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  if (!typeCodesLoaded) typeCodesLoaded = loadSensorTypeCodes();
+
+  bool rosterJustRefreshed = false;
+
+  // Обычный полный обзор раз в 6 часов (все 8 типов, попытка сузить радиус)
+  if (typeCodesLoaded && isNearbyRefreshDue()) {
+    refreshSensorRoster(false);
+    rosterJustRefreshed = true;
+  }
+
+  // Датчики конкретного типа перестали отвечать 30+ минут — сбрасываем его
+  // ростер, дальше подхватит обычный быстрый цикл расширения радиуса ниже
+  if (typeCodesLoaded) checkStaleTypesWatchdog();
+
+  // Быстрый цикл расширения радиуса (каждые 2 минуты, до 2 датчиков на тип)
+  if (typeCodesLoaded && millis()-lastFastExpandCheck > FAST_EXPAND_INTERVAL_MS) {
+    if (anyTypeNeedsExpansion()) {
+      logPrintln("Fast expand: some types still short on sensors, retrying sooner");
+      refreshSensorRoster(true);
+      rosterJustRefreshed = true;
+    }
+    lastFastExpandCheck = millis();
+  }
+
+  // Запрос показаний по самым старым датчикам
+  bool anyKnownSensor = false;
+  for (int i=0; i<S_COUNT; i++) if (rosterCount[i] > 0) { anyKnownSensor = true; break; }
+
+  if (!rosterJustRefreshed && typeCodesLoaded && anyKnownSensor && isScheduledMinuteNow()) {
+    fetchOldestSensors();
+    computeResults();
+  }
+
+  // Яндекс.Погода: первый запрос — через 5 минут после старта. Далее —
+  // адаптивно: за 30 минут до истечения актуальности текущего слота
+  // "+2 часа" (nextYandexFetchTs считается внутри после каждого успешного
+  // запроса). При неудаче — повтор через YANDEX_RETRY_AFTER_FAIL_MIN.
+  bool shouldFetchNow = false;
+  if (!firstYandexFetchDone) {
+    shouldFetchNow = (millis() - bootMillis >= YANDEX_STARTUP_DELAY_MS);
+  } else {
+    long nowTs = (long)timeClient.getEpochTime();
+    shouldFetchNow = (nextYandexFetchTs > 0 && nowTs >= nextYandexFetchTs);
+  }
+
+  if (shouldFetchNow) {
+    fetchYandexWeather();
+    firstYandexFetchDone = true;
+
+    long nowTs = (long)timeClient.getEpochTime();
+    if (yandexReachable && yandexPlus2h.valid) {
+      // Следующий запрос — за 30 минут до истечения актуальности этого слота
+      nextYandexFetchTs = yandexPlus2h.time - (long)YANDEX_PRE_EXPIRY_MIN * 60;
+      // Защита: если по какой-то причине это время уже в прошлом
+      // (например, слот оказался слишком близко к "сейчас") — не зависаем
+      // в цикле непрерывных запросов, даём хотя бы небольшую паузу.
+      if (nextYandexFetchTs <= nowTs) nextYandexFetchTs = nowTs + (long)YANDEX_RETRY_AFTER_FAIL_MIN * 60;
+    } else {
+      // Неудача — пробуем снова через 30 минут, не ждём расчётного времени
+      nextYandexFetchTs = nowTs + (long)YANDEX_RETRY_AFTER_FAIL_MIN * 60;
+    }
+  }
+}
+
+void networkTaskFn(void* pvParameters) {
+  for (;;) {
+    networkTaskLoop();
+    vTaskDelay(pdMS_TO_TICKS(500)); // отдаём управление планировщику между проверками
+  }
 }
 
 void loop() {
@@ -3699,82 +3865,20 @@ void loop() {
   if (apModeActive) dnsServer.processNextRequest();
 
   updateDHT11(); // локальный датчик — не зависит от WiFi, опрашивается всегда
+  updateHeapDiagnostics(); // тоже всегда — диагностика памяти не должна зависеть от сети
 
   timeClient.update();
 
-  if (!typeCodesLoaded && WiFi.status()==WL_CONNECTED)
-    typeCodesLoaded = loadSensorTypeCodes();
-
-  bool rosterJustRefreshed = false;
-
-  // Обычный полный обзор раз в 6 часов (все 8 типов, попытка сузить радиус)
-  if (typeCodesLoaded && isNearbyRefreshDue() && WiFi.status()==WL_CONNECTED) {
-    refreshSensorRoster(false);
-    rosterJustRefreshed = true;
-  }
-
-  // Датчики конкретного типа перестали отвечать 30+ минут — сбрасываем его
-  // ростер, дальше подхватит обычный быстрый цикл расширения радиуса ниже
-  if (typeCodesLoaded && WiFi.status()==WL_CONNECTED) checkStaleTypesWatchdog();
-
-  // Быстрый цикл расширения радиуса (каждые 2 минуты, до 2 датчиков на тип)
-  if (typeCodesLoaded && WiFi.status()==WL_CONNECTED &&
-      millis()-lastFastExpandCheck > FAST_EXPAND_INTERVAL_MS) {
-    if (anyTypeNeedsExpansion()) {
-      logPrintln("Fast expand: some types still short on sensors, retrying sooner");
-      refreshSensorRoster(true);
-      rosterJustRefreshed = true;
-    }
-    lastFastExpandCheck = millis();
-  }
-
-  // Запрос показаний по самым старым датчикам
-  bool anyKnownSensor = false;
-  for (int i=0; i<S_COUNT; i++) if (rosterCount[i] > 0) { anyKnownSensor = true; break; }
-
-  if (!rosterJustRefreshed && typeCodesLoaded && anyKnownSensor &&
-      isScheduledMinuteNow() && WiFi.status()==WL_CONNECTED) {
-    fetchOldestSensors();
-    computeResults();
-  }
-
-  // Яндекс.Погода: первый запрос — через 5 минут после старта. Далее —
-  // адаптивно: за 30 минут до истечения актуальности текущего слота
-  // "+2 часа" (nextYandexFetchTs считается внутри после каждого успешного
-  // запроса). При неудаче — повтор через YANDEX_RETRY_AFTER_FAIL_MIN.
-  if (WiFi.status()==WL_CONNECTED) {
-    bool shouldFetchNow = false;
-
-    if (!firstYandexFetchDone) {
-      shouldFetchNow = (millis() - bootMillis >= YANDEX_STARTUP_DELAY_MS);
-    } else {
-      long nowTs = (long)timeClient.getEpochTime();
-      shouldFetchNow = (nextYandexFetchTs > 0 && nowTs >= nextYandexFetchTs);
-    }
-
-    if (shouldFetchNow) {
-      fetchYandexWeather();
-      firstYandexFetchDone = true;
-
-      long nowTs = (long)timeClient.getEpochTime();
-      if (yandexReachable && yandexPlus2h.valid) {
-        // Следующий запрос — за 30 минут до истечения актуальности этого слота
-        nextYandexFetchTs = yandexPlus2h.time - (long)YANDEX_PRE_EXPIRY_MIN * 60;
-        // Защита: если по какой-то причине это время уже в прошлом
-        // (например, слот оказался слишком близко к "сейчас") — не зависаем
-        // в цикле непрерывных запросов, даём хотя бы небольшую паузу.
-        if (nextYandexFetchTs <= nowTs) nextYandexFetchTs = nowTs + (long)YANDEX_RETRY_AFTER_FAIL_MIN * 60;
-      } else {
-        // Неудача — пробуем снова через 30 минут, не ждём расчётного времени
-        nextYandexFetchTs = nowTs + (long)YANDEX_RETRY_AFTER_FAIL_MIN * 60;
-      }
-    }
-  }
+  // narodmon/Яндекс — блокирующие HTTP-запросы теперь выполняются в фоновой
+  // задаче networkTaskLoop() (см. выше, сразу после setup()), а не здесь.
+  // loop() больше не ждёт их ни секунды — кнопка и веб-сервер опрашиваются
+  // независимо от того, идёт ли сейчас сетевой запрос.
 
   if (!apModeActive) {
     handleTouchButton();
     updateCarousel();
   }
   updateStatusLed();
-  delay(200);
+  delay(20); // раньше 200 — кнопка опрашивается в 10 раз чаще, меньше окно,
+             // в которое сетевой вызов может задержать реакцию на нажатие
 }

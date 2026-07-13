@@ -1893,9 +1893,9 @@ void iconWindsock(int cx, int cy, float speedMs) {
   int mastX = cx - 14, mastTopY = cy - 12;
   tft.drawFastVLine(mastX, mastTopY, 24, TFT_WHITE); // мачта
   int tipX = mastX + reach, tipY = mastTopY + 2 + droop;
-  tft.drawLine(mastX, mastTopY,   tipX, tipY, TFT_ORANGE);
-  tft.drawLine(mastX, mastTopY+8, tipX, tipY, TFT_ORANGE);
-  tft.drawLine(mastX, mastTopY,   mastX, mastTopY+8, TFT_ORANGE);
+  tft.drawLine(mastX, mastTopY,   tipX, tipY, TFT_SKYBLUE);
+  tft.drawLine(mastX, mastTopY+8, tipX, tipY, TFT_SKYBLUE);
+  tft.drawLine(mastX, mastTopY,   mastX, mastTopY+8, TFT_SKYBLUE);
 }
 
 void iconDust(int cx, int cy, float value) {
@@ -1920,17 +1920,17 @@ void iconDust(int cx, int cy, float value) {
 
 // Настоящая капля-"слеза": скруглённый низ (круг) + заострённый верх
 // (треугольник, смыкающийся с верхней частью круга) — не "груша" из двух
-// кружков разного размера. Цвет теперь тоже меняется от влажности — от
-// бледно-серо-голубого (сухо) до насыщенного синего (влажно), в дополнение
-// к форме (контур/толстый контур/заливка).
+// кружков разного размера. Цвет тоже меняется от влажности — от бледного
+// бежевого (сухо) до насыщенного оранжевого (влажно), в дополнение к
+// форме (контур/толстый контур/заливка).
 uint16_t humidityGradientColor(float humidity) {
   float t = humidity / 100.0f;
   if (t < 0) t = 0;
   if (t > 1) t = 1;
-  // 0%: бледный серо-голубой (200,200,210) -> 100%: насыщенный синий (20,80,210)
-  uint8_t r = (uint8_t)(200 - t * 180);
-  uint8_t g = (uint8_t)(200 - t * 120);
-  uint8_t b = (uint8_t)(210 + t * 0); // остаётся высоким на всём диапазоне
+  // 0%: бледный бежевый (220,210,190) -> 100%: насыщенный оранжевый (255,140,0)
+  uint8_t r = (uint8_t)(220 + t * 35);
+  uint8_t g = (uint8_t)(210 - t * 70);
+  uint8_t b = (uint8_t)(190 - t * 190);
   return tft.color565(r, g, b);
 }
 
@@ -2071,7 +2071,7 @@ void drawDhtValueBlock(const char* label, const char* unit, float value, bool va
 
   // Иконка "домик" — та же безопасная зона и та же защита от наложения
   // на длинный текст, что и у мини-иконок датчиков narodmon
-  if (unitTextRightEdge < 200) iconHouse(218, topY + 29, TFT_ORANGE);
+  if (unitTextRightEdge < 200) iconHouse(218, topY + 29, TFT_SKYBLUE);
 
   // Тренд-бар — тот же формат и высота (26px), что у обычных блоков
   // drawParamBlock; свой отдельный буфер (dhtTrends.temp / .hum), не
@@ -2267,13 +2267,13 @@ void drawSunTimesBlock(int topY, int blockHeight, uint16_t bg) {
 
   int midY = topY + blockHeight/2;
 
-  tft.setTextSize(1); tft.setTextColor(TFT_ORANGE, bg);
+  tft.setTextSize(1); tft.setTextColor(TFT_SKYBLUE, bg);
   tft.setCursor(6, topY+8); tft.print("SUNRISE");
   tft.setTextSize(3); tft.setTextColor(TFT_WHITE, bg);
   tft.setCursor(6, midY-6);
   tft.print(st.valid ? hoursToHHMM(st.sunriseUtcHour) : String("N/D"));
 
-  tft.setTextSize(1); tft.setTextColor(TFT_SKYBLUE, bg);
+  tft.setTextSize(1); tft.setTextColor(TFT_ORANGE, bg);
   tft.setCursor(126, topY+8); tft.print("SUNSET");
   tft.setTextSize(3); tft.setTextColor(TFT_WHITE, bg);
   tft.setCursor(126, midY-6);
@@ -2356,8 +2356,8 @@ void drawWeatherIconBlock(int topY, int blockHeight, uint16_t bg) {
       break;
     case WI_RAIN:
       wiCloud(cx, cy-8, TFT_DARKGREY);
-      for (int i=0;i<4;i++) tft.drawLine(cx-14+i*9, cy+8, cx-18+i*9, cy+22, TFT_SKYBLUE);
-      label = "Rain"; labelColor = TFT_SKYBLUE;
+      for (int i=0;i<4;i++) tft.drawLine(cx-14+i*9, cy+8, cx-18+i*9, cy+22, TFT_ORANGE);
+      label = "Rain"; labelColor = TFT_ORANGE;
       break;
     case WI_SNOW:
       wiCloud(cx, cy-8, TFT_LIGHTGREY);

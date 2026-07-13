@@ -2083,7 +2083,7 @@ void drawDhtValueBlock(const char* label, const char* unit, float value, bool va
 int drawParamBlock(int idx, int topY, int blockHeight, bool bigNumber, uint16_t bg) {
   // Красный — подтверждённый алерт (2 опроса подряд за порогом). Синий —
   // единичный всплеск, ещё не подтверждён (см. checkPerParameterAlarms).
-  uint16_t numColor = results[idx].inAlarm ? TFT_RED : (alarmPending[idx] ? TFT_BLUE : TFT_WHITE);
+  uint16_t numColor = results[idx].inAlarm ? TFT_BLUE : (alarmPending[idx] ? TFT_SKYBLUE : TFT_WHITE);
 
   // Максимально увеличенный шрифт, который ещё помещается по высоте в зазор
   // до тренд-бара (проверено на экстремальных значениях: "-9.5"/"35.0" для
@@ -2337,8 +2337,8 @@ void drawWeatherIconBlock(int topY, int blockHeight, uint16_t bg) {
 
   switch (icon) {
     case WI_SUN:
-      wiSun(cx, cy, TFT_YELLOW);
-      label = "Sunny"; labelColor = TFT_YELLOW;
+      wiSun(cx, cy, TFT_CYAN);
+      label = "Sunny"; labelColor = TFT_CYAN;
       break;
     case WI_SUN_CLOUD:
       wiSun(cx-8, cy-6, TFT_YELLOW);
@@ -2367,10 +2367,10 @@ void drawWeatherIconBlock(int topY, int blockHeight, uint16_t bg) {
     case WI_STORM: {
       wiCloud(cx, cy-8, TFT_DARKGREY);
       int lx = cx, ly = cy+4;
-      tft.drawLine(lx, ly, lx-6, ly+10, TFT_YELLOW);
-      tft.drawLine(lx-6, ly+10, lx+2, ly+10, TFT_YELLOW);
-      tft.drawLine(lx+2, ly+10, lx-4, ly+22, TFT_YELLOW);
-      label = "Storm"; labelColor = TFT_YELLOW;
+      tft.drawLine(lx, ly, lx-6, ly+10, TFT_CYAN);
+      tft.drawLine(lx-6, ly+10, lx+2, ly+10, TFT_CYAN);
+      tft.drawLine(lx+2, ly+10, lx-4, ly+22, TFT_CYAN);
+      label = "Storm"; labelColor = TFT_CYAN;
       break;
     }
     default:
